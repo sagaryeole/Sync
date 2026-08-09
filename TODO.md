@@ -66,52 +66,239 @@ Raw ticks (~13/s) **never** hit disk.
 
 ---
 
-## Phase 0 — Safety net & tooling
+# 🔒 Threat model & hardening
 
-**Effort: S · Leaves the app: byte-identical, but versioned and with working scripts**
+> **"Hack proof" is not a reachable state — but *proportionate* is.** What matters is being honest
+> about who can actually attack this and closing those paths properly.
 
-- [ ] **1. Initialise git and commit the baseline**
-  ```bash
-  cd /Users/developer/Projects/CryptoTradeApp
-  git init
-  git add -A && git commit -m "chore: baseline before live-data rewrite"
+**Realistic attackers, today:**
+
+| Attacker | Reachable? | Covered by |
+| --- | --- | --- |
+| A malicious website open in your browser while the app runs | **YES — this is the real one** | H2, H3 |
+| Someone else on your WiFi | **YES** | H3 ✅ fixed |
+| The exchange feed sending hostile/garbage data | **YES** | H1, H4, H11 |
+| A compromised npm/PyPI dependency | Yes | H17 |
+| A remote internet attacker | Only if you deliberately expose it | H3, H2 |
+
+**Blast radius today is bounded** — no real money, no broker key, virtual cash.
+**That changes completely the moment a real broker API key is added.** See "Before connecting a real
+broker" at the bottom of this section.
+
+---
+
+## 🔴 Critical — fix as part of the phase noted
+
+- [ ] **H1 · `NaN`/`Infinity` from the feed permanently corrupts the engine** *(Phase 1, steps 16–17)*
+
+  **Verified on this machine, not theoretical:**
   ```
-  This is the only thing that makes later deletions safe.
-
-- [ ] **2. Create the root `.gitignore`, then untrack what shouldn't be committed**
-  Contents: `__pycache__/`, `*.pyc`, `.pytest_cache/`, `.venv/`, `venv/`, `*.db`, `*.db-journal`,
-  `*.db-wal`, `*.db-shm`, `node_modules/`, `dist/`, `.env`, `.DS_Store`, `coverage/`
-  ```bash
-  git rm -r --cached frontend/dist backend/crypto.db backend/.pytest_cache
-  find . -name .DS_Store -exec git rm --cached {} +
-  git commit -m "chore: add gitignore, untrack build artifacts"
+  json.loads('{"price": NaN}')       -> nan    ACCEPTED  (Python allows non-standard JSON)
+  equity=NaN:  `equity < peak*0.75`  -> False  <-- kill-switch NEVER fires
+               `equity > 0`          -> False  <-- and the sanity guard also fails
+  avg_entry after 3 good fills following one NaN fill  -> nan   (permanently poisoned)
   ```
+  Every comparison against `NaN` is `False`, so a single bad tick **silently disables the
+  max-drawdown kill-switch and every guard meant to catch it**, then poisons cost basis forever.
+  This is the highest-severity finding in the whole plan.
 
-- [ ] **3. Fix `backend/run.sh`** — currently hardcodes `cd /app/CryptoTradeApp/backend`
-  (a container path that does not exist on this machine) and launches on **port 15678**
-  while every doc and the Vite proxy say 8000.
-  ```bash
-  #!/usr/bin/env bash
-  set -euo pipefail
-  cd "$(dirname "$0")"
-  exec python3 -m uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}" --reload
+  **Fix — both layers, not just one:**
+  1. `json.loads(raw, parse_constant=_reject)` in **every** feed parser → raises on `NaN`/`Infinity`
+  2. A `validate_tick()` gate that every `Tick` must pass before reaching `MarketState`:
+     `math.isfinite(price)` · `price > 0` · `bid <= ask` when both present · `ts` within ±60s of now
+  3. Assert `math.isfinite()` on `equity`, `cash`, and `avg_entry` after every `apply_fill`;
+     raise and halt the strategy if violated. **Fail loudly — never let NaN travel.**
+
+- [ ] **H2 · Cross-Site WebSocket Hijacking (CSWSH)** *(Phase 3, step 40)*
+
+  **WebSockets are exempt from the same-origin policy, and Starlette's `CORSMiddleware` does not
+  apply to the WS handshake at all.** So the 7-origin CORS list protects nothing here. Any website
+  you visit while the app is running can run:
+  ```js
+  new WebSocket('ws://localhost:8000/ws').onmessage = e => exfiltrate(e.data)
   ```
+  …and stream your entire portfolio, positions, P&L, and strategy signals to a third party.
+  If the WS ever accepts order commands, it can also **trade on your behalf**.
 
-- [ ] **4. Fix `frontend/run.sh`** the same way → `npm run dev -- --port "${PORT:-3355}"`
+  **Fix:**
+  1. Validate the `Origin` header in the handshake against an allowlist; on mismatch
+     `await ws.close(code=1008)` **before** `accept()`
+  2. Reject a **missing** `Origin` too (non-browser clients should use the token path)
+  3. Keep `/ws` read-only — order submission stays on REST where CORS preflight applies
+  4. Single-use connect token from `GET /ws/token` for any non-localhost deployment
 
-- [ ] **5. Add `/Users/developer/Projects/CryptoTradeApp/dev.sh`** — starts both servers,
-  `trap 'kill 0' INT TERM` so Ctrl-C kills the whole process group. `chmod +x` all three scripts.
+- [x] **H3 · Binding `0.0.0.0` exposed an unauthenticated trading API to the whole LAN** — ✅ **fixed in Phase 0**
+  `run.sh` now defaults to `127.0.0.1`; `HOST=0.0.0.0` is opt-in and carries a warning.
 
-- [ ] **6. Fix `backend/pyproject.toml`**
-  - `requires-python = ">=3.9"` (match reality)
-  - Delete the stray `edition = "2021"` key — a Cargo-ism, meaningless in `[project]`
+- [ ] **H4 · A single bad print cascades every stop-loss** *(Phases 1–2)*
 
-- [ ] **7. Add the missing dependencies to `backend/requirements.txt`** and mirror into `pyproject.toml`
-  > `pytest` and `httpx` are used by the test suite but declared **nowhere** — the suite
-  > currently cannot be installed from `requirements.txt` alone.
+  One glitched tick — exchange error, thin-book spike, or the **~5bp USDT/USD basis when failing
+  over to Binance** — fires every stop in the book at once.
 
-  Add: `pytest>=8`, `pytest-asyncio>=0.24`, `httpx>=0.27`, `websockets>=12`, `pydantic-settings>=2.5`
-  Then add `asyncio_mode = auto` to `backend/pytest.ini`.
+  **Fix:** reject a tick whose move exceeds `max_tick_move_pct` (default 10%) from the last
+  *accepted* price unless **K=2 consecutive** ticks confirm it (then it's real, adopt it).
+  Additionally **pause stop/TP evaluation for 10s after any provider switch**, and never evaluate
+  stops against a mark older than 30s (the plan's `STALE_PRICE` guard — make sure it gates
+  *stops*, not just new orders).
+
+## 🟠 High — robustness and correctness
+
+- [ ] **H5 · Crash recovery: in-memory authority + DB-as-log will silently diverge** *(Phase 2, step 30)*
+
+  The plan says `PaperEngine.load_from_db()` but not *from what*. If it restores the mutable
+  `positions` snapshot, and the process died between the in-memory mutation and the commit,
+  the engine restarts with wrong state and never notices.
+
+  **Fix — make the log authoritative:**
+  1. `fills` is **append-only and the single source of truth**; `positions`/`portfolios` are a
+     derived cache
+  2. Write the fill **and** the position/cash update in **one transaction** — never two
+  3. On startup, **rebuild by deterministic replay of `fills`**, then compare against the cached
+     snapshot and **log any divergence loudly**
+  4. Bonus: this replay is free time-travel — see V1
+
+- [ ] **H6 · No order state machine → fill-after-cancel races** *(Phases 2–3)*
+
+  The 1s `engine_tick` and a REST `DELETE /orders/{id}` can interleave.
+  **Fix:** explicit `PENDING → FILLED | REJECTED | CANCELLED | EXPIRED`, illegal transitions
+  rejected, all transitions inside the engine `RLock`, plus a DB `CHECK` constraint on `status`.
+
+- [ ] **H7 · Float money drifts; the identity test hides it behind a tolerance** *(Phase 2, step 27)*
+
+  **Fix:** keep floats (they're fast and fine here), but (a) round to the symbol's `price_dp`/`qty_dp`
+  at fill time, and (b) add a **reconciliation job** that recomputes `cash`/`realized_pnl` from the
+  `fills` log and logs any drift > $0.01. This catches genuine accounting bugs, not just float noise.
+
+- [ ] **H8 · Unbounded resource consumption** *(Phase 3)*
+  - Every `limit=` query param is uncapped → `?limit=99999999` is a one-line DoS. **Cap at 1000 server-side.**
+  - WS: cap **topics per connection** (64), **connections per IP** (8), and set an explicit
+    inbound `max_size`. Reject unknown `op` values instead of ignoring them.
+  - Validate `interval` against an enum — never interpolate it anywhere.
+
+- [ ] **H9 · Strategy params from the API are untrusted input** *(Phase 3, step 43)*
+
+  `{"period": 1000000000}` hangs a scheduler thread; `{"period": -1}` or `0` throws deep in an
+  indicator. **Fix:** a per-strategy pydantic params schema with `ge`/`le` bounds, validated before
+  persisting. **`json.loads` only — never `eval`, never `pickle`** for `params_json`/`indicators_json`.
+
+- [ ] **H10 · Enumerate and guard every division** *(Phase 2)*
+  `avg_entry` when total qty is 0 · `price/ma` when `ma == 0` · `drawdown` when `peak == 0` ·
+  `return_pct` when `starting_cash == 0` · every indicator on a short/empty candle list.
+  Each returns a defined value or raises — none may produce `inf`/`NaN` (see H1).
+
+- [ ] **H11 · Exchange timestamps are trusted for candle bucketing** *(Phase 1, step 21)*
+
+  A wrong or spoofed exchange clock places candles in the future or reorders bars.
+  **Fix: bucket on server receive time**, keep exchange time as metadata. This also fixes the
+  existing bug class where identical timestamps make `order_by(timestamp desc)` resolve arbitrarily.
+
+## 🟡 Medium
+
+- [ ] **H12** Set an explicit `max_size` on the outbound feed WS clients — a hostile or broken endpoint
+  can otherwise exhaust memory with one frame.
+- [ ] **H13** Global outbound rate limiter; honor `429` + `Retry-After`; circuit-breaker the 120s
+  failback probe so a network blip can't turn into a thundering herd.
+- [ ] **H14** Server-validate `client_order_id` (UUID format, length cap) and bound the dedupe set —
+  a client-supplied key is untrusted and currently unbounded.
+- [ ] **H15** `/health` must not leak config — no env dump, no DB path, no origin list. Status only.
+- [ ] **H16** Audit-log risk-parameter changes from the Settings page, or "why did it suddenly size 10×"
+  is unanswerable.
+- [ ] **H17** Supply chain: commit both lockfiles, pin the new deps to exact versions, and add
+  `pip-audit` + `npm audit --omit=dev` to Phase 7.
+- [ ] **H18** Decide whether the kill-switch halts the **manual** portfolio too (probably not — make it
+  configurable), and note that flattening at market during a crash is worst-case liquidity by design.
+
+## 🚦 Before connecting a real broker — non-negotiable gate
+
+Today's bounded blast radius is doing a lot of the security work. All of this must exist *first*:
+
+1. Real authentication on **every** endpoint and on the WS handshake — not just `Origin` checks
+2. API keys in an OS keychain or a secrets manager — **never** `.env`, never the repo
+3. Server-side kill-switch that survives restart, plus a hard daily-loss cap
+4. Mandatory `dry_run` soak (V4) with a real key in **read-only** mode first
+5. Signed, append-only audit log of every order with the reasoning that produced it
+6. Rate limiting and idempotency on the broker path — a retry storm must never double-submit
+7. Withdrawal permissions **disabled** on the API key; IP-allowlist it
+
+---
+
+# 💡 Value-adds worth building
+
+- [ ] **V1 · Deterministic replay / time-travel** — falls out of **H5 for free** once `fills` is the
+  source of truth. Rebuild the portfolio as of any timestamp, answer "why did it trade that",
+  and it's 80% of a backtester without building one.
+- [ ] **V2 · Feed recorder → replayable fixtures** *(Phase 1)* — dump raw ticks to JSONL; replay them
+  through `SyntheticFeed`. Gives **deterministic integration tests against real market data** and
+  lets you reproduce any bug exactly. Cheap, and the highest-leverage testing tool here.
+- [ ] **V3 · Per-symbol circuit breaker** — if one symbol's feed goes stale or erratic, halt trading
+  *that symbol* instead of the whole engine. Agility: degrade partially, not totally.
+- [ ] **V4 · `dry_run` (shadow) mode per strategy** — evaluate and log signals without trading.
+  Validate a new strategy against the live feed at zero risk, then promote it. Also the safety
+  gate for the broker path above.
+- [ ] **V5 · Structured JSON logging with a correlation ID** threaded tick → signal → order → fill.
+  Turns "why did it do that" from archaeology into a `grep`.
+- [ ] **V6 · WS gap recovery** — the plan *detects* `seq` gaps; make it *act*: on a gap, re-hydrate
+  that topic over REST instead of silently drifting out of sync.
+
+---
+
+## Phase 0 — Safety net & tooling ✅ COMPLETE
+
+**Effort: S · Result: identical app, now versioned, with working scripts. 31/31 tests still passing.**
+
+Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
+
+- [x] **1. Initialise git and commit the baseline** — `git init` + full-tree commit `709ddfc`
+
+- [x] **2. Create the root `.gitignore`**
+  > **Deviation from plan, deliberate:** the `.gitignore` was written **before** `git init`, not after.
+  > The original sequence (commit everything, then `git rm --cached`) would have put **91 MB of
+  > `node_modules` across 4,338 files** permanently into history — and since the remote is a
+  > **public** repo, that history is unrewritable once pushed. Writing the ignore file first means
+  > 36 clean source files and nothing to untrack.
+  >
+  > Also ignored beyond the original list: `.claude/settings.local.json` (personal tooling config)
+  > and `.env.*` with a `!.env.example` negation.
+
+- [x] **3. Fix `backend/run.sh`** — resolved its own dir; port 15678 → `${PORT:-8000}`;
+  `pip install` made opt-in via `INSTALL=1` instead of running on every boot
+  > **Hardening applied (H3):** the plan said `--host 0.0.0.0`. That publishes an **unauthenticated
+  > API that can place trades** to every device on the network. Default is now `127.0.0.1`;
+  > `HOST=0.0.0.0` is opt-in and carries a warning in the script.
+
+- [x] **4. Fix `frontend/run.sh`** — same `cd` fix, `--port "${PORT:-3355}"`, auto-installs only if
+  `node_modules` is absent
+
+- [x] **5. Add `dev.sh`** — runs both, `trap 'kill 0' INT TERM EXIT`, prints both URLs. All three
+  scripts `chmod +x`.
+
+- [x] **6. Fix `backend/pyproject.toml`** — `requires-python = ">=3.9"`, stray `edition = "2021"` removed
+
+- [x] **7. Declare the missing dependencies** — added `httpx`, `websockets`, `pydantic-settings`,
+  `pytest`, `pytest-asyncio` to `requirements.txt` and `pyproject.toml`
+  (with a `[project.optional-dependencies] dev` group); `asyncio_mode = auto` added to `pytest.ini`
+  > Note: `asyncio_mode` warns as an unknown option until `pytest-asyncio` is actually installed
+  > (`pip install -r requirements.txt`). Harmless until Phase 1 adds async tests.
+
+**✅ Gate met:** `cd backend && python3 -m pytest -q` → **31 passed**.
+
+### Remaining Phase 0 item — your decision, not started
+
+- [ ] **7b. Push to `github.com/sagaryeole/Sync`**
+
+  Local history is clean and ready (2 commits, no secrets, no `node_modules`, no DB).
+  **Not pushed yet — two things to confirm first:**
+  1. **The repo is PUBLIC.** Pushing publishes this code permanently to a search-indexed,
+     forkable, cacheable location. There are no secrets in it (verified by scan), so this is safe —
+     but it should be a deliberate choice, not a side effect.
+  2. **The repo is named `Sync`, not `CryptoTradeApp`** — worth confirming it's the repo you meant.
+
+  When confirmed:
+  ```bash
+  git remote add origin https://github.com/sagaryeole/Sync.git
+  git branch -M main
+  git push -u origin main
+  ```
 
 **✅ Phase 0 gate:** `cd backend && python3 -m pytest -q` → **31 passed**. `./dev.sh` starts both servers.
 
@@ -120,6 +307,7 @@ Raw ticks (~13/s) **never** hit disk.
 ## Phase 1 — Config, schema, and the live feed
 
 **Effort: L · Leaves the app: existing UI, but showing 8 real live prices from Coinbase**
+**🔒 Hardening due this phase: H1 (NaN rejection — do this in the parser, not later), H4 (tick sanity band), H11 (bucket on receive time), H12, H13. 💡 Also build V2 (feed recorder) here — it pays for itself immediately in Phase 7.**
 
 ### 1a · Configuration
 
@@ -322,6 +510,7 @@ Raw ticks (~13/s) **never** hit disk.
 ## Phase 2 — Paper trading engine + multi-strategy
 
 **Effort: L · Leaves the app: four live paper portfolios trading real prices**
+**🔒 Hardening due this phase: H5 (fills as source of truth — this shapes the whole module, do it first not last), H6 (order state machine), H7 (reconciliation job), H10 (division guards), H18. 💡 V1 and V4 fall out of H5 almost free.**
 
 - [ ] **27. Create `backend/engine/portfolio.py`** — `PortfolioAccount`, in-memory authoritative
   hot state per strategy (the DB is a durable log). **Port the weighted-average cost-basis logic
@@ -407,6 +596,7 @@ Property test proves `equity == cash + realized + unrealized` at every step.
 ## Phase 3 — WebSocket API + REST v2
 
 **Effort: M · Leaves the app: live ticks/orders/fills/equity streaming over `/ws`**
+**🔒 Hardening due this phase: H2 (Origin validation — the WS is otherwise readable by any website you visit), H8 (cap limits/topics/connections), H9 (strategy param bounds), H14, H15.**
 
 - [ ] **38. Create `backend/ws/hub.py`** — `Connection(id, ws, topics, queue=asyncio.Queue(maxsize=256), dropped)`
   and `Hub` with `connect/disconnect/subscribe/unsubscribe/publish/_writer`.
@@ -673,6 +863,22 @@ equity curves diverge across strategies · leaderboard reorders as bots perform.
     subscribe/unsubscribe, heartbeat, unknown-topic error, overflow drop behaviour
   - Rework `test_integration.py` — synthetic tick → signal → order → fill → position → snapshot
     → REST → WS
+  - **`test_security.py` — one test per hardening item, so a regression is a red test, not an incident:**
+    - **H1** feeding `{"price": NaN}`, `Infinity`, `-1`, `0`, and a 60s-stale `ts` each raise and
+      never reach `MarketState`; `apply_fill` raises on non-finite equity
+    - **H2** WS handshake with a foreign `Origin` → closed `1008`; missing `Origin` → closed;
+      allowed origin → accepted
+    - **H4** a +50% single tick is rejected; the same move confirmed by 2 consecutive ticks is adopted;
+      stops don't evaluate for 10s after a provider switch
+    - **H5** kill the engine mid-sequence, replay `fills` from scratch, assert the rebuilt state
+      matches exactly — **the single most valuable test in the suite**
+    - **H6** cancel-then-fill and fill-then-cancel both end in exactly one terminal state
+    - **H8** `?limit=99999999` is capped; the 65th topic subscription is refused; the 9th
+      connection from one IP is refused
+    - **H9** `{"period": 10**9}` and `{"period": -1}` are both rejected at the schema boundary
+    - **H10** every guarded division returns a defined value rather than `inf`/`NaN`
+  - **V2 payoff:** replay a recorded JSONL tick file through `SyntheticFeed` as a full-system
+    regression test against *real* market data, deterministically.
 
 - [ ] **69. Frontend tests** —
   `npm i -D vitest@^3.2.7 @vitest/coverage-v8@^3.2.7 jsdom@^26 @testing-library/react@^16.3 @testing-library/jest-dom@^6 @testing-library/user-event@^14`
@@ -738,4 +944,9 @@ making it true) · a backtesting harness — *a whole second product; noted as f
 | Frontend re-render storms (8 symbols × 4 Hz) | Selectors + `useSyncExternalStore` + imperative charts — step 53 |
 | Strategies churning on 1m bars lose to fees | Closed bars only, 15s cadence, 3-bar cooldown — steps 29, 35 |
 | `crypto.db` gets dropped | Synthetic data only; the reset logs loudly — step 14 |
-| WS has no auth | Fine on localhost; documented as a prod gap |
+| ~~WS has no auth — "fine on localhost"~~ | **Revised: this was wrong.** WebSockets bypass the same-origin policy, so any website you visit can read the stream. Origin validation is required, not optional — **H2** |
+| A single `NaN` tick silently disables the kill-switch | **H1** — verified reproducible; reject at the JSON parser *and* validate every tick |
+| Engine state diverges from disk after a crash | **H5** — `fills` append-only as source of truth; rebuild by replay and log divergence |
+
+> Security and adversarial-input risks live in **🔒 Threat model & hardening** near the top of this
+> file. That section supersedes the "documented as a prod gap" hand-wave that was in this table.
