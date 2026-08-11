@@ -125,4 +125,24 @@ def test_get_bot_signals():
     r = client.get("/bot/signals")
     assert r.status_code == 200
     data = r.json()
-    assert set(data.keys()) == {"BTC", "ETH", "SOL"}
+    assert set(data.keys()) == set(a["symbol"] for a in config.ASSETS)
+
+
+def test_list_trades_limit_capped():
+    """H8: limit query param must be capped at 1000 server-side."""
+    session = get_session()
+    for i in range(1500):
+        session.add(TradeLog(
+            type="BUY",
+            symbol="BTC",
+            quantity=0.01,
+            price=50000.0 + i,
+            timestamp=datetime.now(timezone.utc)
+        ))
+    session.commit()
+    session.close()
+
+    r = client.get("/trades?limit=99999999")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data) <= 1000

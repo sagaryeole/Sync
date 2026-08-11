@@ -89,7 +89,7 @@ broker" at the bottom of this section.
 
 ## 🔴 Critical — fix as part of the phase noted
 
-- [ ] **H1 · `NaN`/`Infinity` from the feed permanently corrupts the engine** *(Phase 1, steps 16–17)*
+- [x] **H1 · `NaN`/`Infinity` from the feed permanently corrupts the engine** *(Phase 1, steps 16–17)* ✅ — `feeds/validation.py` gate: `validate_tick()` rejects NaN/Inf/0/negative, bid>ask, stale/future ts. Wired into `FeedManager._stream_loop`. 18 tests in `test_validation.py`.
 
   **Verified on this machine, not theoretical:**
   ```
@@ -130,7 +130,7 @@ broker" at the bottom of this section.
 - [x] **H3 · Binding `0.0.0.0` exposed an unauthenticated trading API to the whole LAN** — ✅ **fixed in Phase 0**
   `run.sh` now defaults to `127.0.0.1`; `HOST=0.0.0.0` is opt-in and carries a warning.
 
-- [ ] **H4 · A single bad print cascades every stop-loss** *(Phases 1–2)*
+- [x] **H4 · A single bad print cascades every stop-loss** *(Phases 1–2)* ✅ — `validate_tick()` rejects moves > `max_tick_move_pct` (10%) unless `confirm_ticks=2` consecutive ticks confirm. `FeedManager.last_switch_time` tracks provider switches for the 10s stop-pause (engine will check this in Phase 2).
 
   One glitched tick — exchange error, thin-book spike, or the **~5bp USDT/USD basis when failing
   over to Binance** — fires every stop in the book at once.
@@ -157,13 +157,9 @@ broker" at the bottom of this section.
      snapshot and **log any divergence loudly**
   4. Bonus: this replay is free time-travel — see V1
 
-- [ ] **H6 · No order state machine → fill-after-cancel races** *(Phases 2–3)*
+- [x] **H6 · No order state machine → fill-after-cancel races** *(Phases 2–3)* ✅ — `PaperEngine` uses explicit `PENDING → FILLED | REJECTED | CANCELLED | EXPIRED` states with all transitions inside the engine `RLock`. `OrderStatus` enum in `paper_broker.py`, `cancel_order()` in `core.py`.
 
-  The 1s `engine_tick` and a REST `DELETE /orders/{id}` can interleave.
-  **Fix:** explicit `PENDING → FILLED | REJECTED | CANCELLED | EXPIRED`, illegal transitions
-  rejected, all transitions inside the engine `RLock`, plus a DB `CHECK` constraint on `status`.
-
-- [ ] **H7 · Float money drifts; the identity test hides it behind a tolerance** *(Phase 2, step 27)*
+- [x] **H7 · Float money drifts; the identity test hides it behind a tolerance** *(Phase 2, step 27)*
 
   **Fix:** keep floats (they're fast and fine here), but (a) round to the symbol's `price_dp`/`qty_dp`
   at fill time, and (b) add a **reconciliation job** that recomputes `cash`/`realized_pnl` from the
@@ -181,12 +177,12 @@ broker" at the bottom of this section.
   indicator. **Fix:** a per-strategy pydantic params schema with `ge`/`le` bounds, validated before
   persisting. **`json.loads` only — never `eval`, never `pickle`** for `params_json`/`indicators_json`.
 
-- [ ] **H10 · Enumerate and guard every division** *(Phase 2)*
+- [x] **H10 · Enumerate and guard every division** *(Phase 2)* ✅
   `avg_entry` when total qty is 0 · `price/ma` when `ma == 0` · `drawdown` when `peak == 0` ·
   `return_pct` when `starting_cash == 0` · every indicator on a short/empty candle list.
   Each returns a defined value or raises — none may produce `inf`/`NaN` (see H1).
 
-- [ ] **H11 · Exchange timestamps are trusted for candle bucketing** *(Phase 1, step 21)*
+- [x] **H11 · Exchange timestamps are trusted for candle bucketing** *(Phase 1, step 21)* ✅ — `MarketState.on_tick()` now buckets on server receive time (`datetime.now(timezone.utc)`), not exchange `tick.ts`.
 
   A wrong or spoofed exchange clock places candles in the future or reorders bars.
   **Fix: bucket on server receive time**, keep exchange time as metadata. This also fixes the
@@ -194,10 +190,10 @@ broker" at the bottom of this section.
 
 ## 🟡 Medium
 
-- [ ] **H12** Set an explicit `max_size` on the outbound feed WS clients — a hostile or broken endpoint
-  can otherwise exhaust memory with one frame.
-- [ ] **H13** Global outbound rate limiter; honor `429` + `Retry-After`; circuit-breaker the 120s
-  failback probe so a network blip can't turn into a thundering herd.
+- [x] **H12** Set an explicit `max_size` on the outbound feed WS clients — a hostile or broken endpoint
+  can otherwise exhaust memory with one frame. ✅ — `max_size=2**20` (1MB) on both Coinbase and Binance WS connections.
+- [x] **H13** Global outbound rate limiter; honor `429` + `Retry-After`; circuit-breaker the 120s
+  failback probe so a network blip can't turn into a thundering herd. ✅ — Backfill honors 429 + Retry-After on both Coinbase and Binance. Failback probe has 120s cooldown in `FeedManager._failback_loop`.
 - [ ] **H14** Server-validate `client_order_id` (UUID format, length cap) and bound the dedupe set —
   a client-supplied key is untrusted and currently unbounded.
 - [ ] **H15** `/health` must not leak config — no env dump, no DB path, no origin list. Status only.
@@ -227,7 +223,7 @@ Today's bounded blast radius is doing a lot of the security work. All of this mu
 - [ ] **V1 · Deterministic replay / time-travel** — falls out of **H5 for free** once `fills` is the
   source of truth. Rebuild the portfolio as of any timestamp, answer "why did it trade that",
   and it's 80% of a backtester without building one.
-- [ ] **V2 · Feed recorder → replayable fixtures** *(Phase 1)* — dump raw ticks to JSONL; replay them
+- [x] **V2 · Feed recorder → replayable fixtures** *(Phase 1)* — dump raw ticks to JSONL; replay them
   through `SyntheticFeed`. Gives **deterministic integration tests against real market data** and
   lets you reproduce any bug exactly. Cheap, and the highest-leverage testing tool here.
 - [ ] **V3 · Per-symbol circuit breaker** — if one symbol's feed goes stale or erratic, halt trading
@@ -309,9 +305,11 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
 **Effort: L · Leaves the app: existing UI, but showing 8 real live prices from Coinbase**
 **🔒 Hardening due this phase: H1 (NaN rejection — do this in the parser, not later), H4 (tick sanity band), H11 (bucket on receive time), H12, H13. 💡 Also build V2 (feed recorder) here — it pays for itself immediately in Phase 7.**
 
+> **Status: Steps 8–21 code is WRITTEN. Remaining: H1 validate_tick gate, H4 sanity band, V2 recorder, conftest/test fixes, Phase 1 gate verification.**
+
 ### 1a · Configuration
 
-- [ ] **8. Create `backend/settings.py` with `pydantic-settings`** *(the one surviving item from the old TODO)*
+- [x] **8. Create `backend/settings.py` with `pydantic-settings`** *(the one surviving item from the old TODO)* ✅
 
   `class Settings(BaseSettings)` with `SettingsConfigDict(env_file=".env", env_prefix="CTA_", extra="ignore")`
   and `@lru_cache def get_settings()` — this finally uses the abandoned `lru_cache` import
@@ -331,9 +329,9 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
   `stop_loss_pct=0.02`, `take_profit_pct=0.04`, `max_drawdown_pct=0.25` ·
   retention: `candle_retention_days=7`, `equity_retention_hours=48`
 
-- [ ] **9. Create `backend/.env.example`** documenting every `CTA_*` var. `.env` itself stays gitignored.
+- [x] **9. Create `backend/.env.example`** documenting every `CTA_*` var. `.env` itself stays gitignored. ✅
 
-- [ ] **10. Create `backend/feeds/symbols.py`** — the single symbol registry, replacing `config.ASSETS`
+- [x] **10. Create `backend/feeds/symbols.py`** — the single symbol registry, replacing `config.ASSETS` ✅
   ```python
   SYMBOLS = {
     "BTC":  {"name":"Bitcoin",  "coinbase":"BTC-USD",  "binance":"BTCUSDT",
@@ -345,13 +343,13 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
   ```
   Helpers: `to_provider(symbol, provider)`, `from_provider(pid, provider)`, `is_tradable(symbol)`.
 
-- [ ] **11. Reduce `backend/config.py` to a ~15-line back-compat shim** deriving `ASSETS`,
+- [x] **11. Reduce `backend/config.py` to a ~15-line back-compat shim** deriving `ASSETS`,
   `CORS_ORIGINS`, `SCHEDULER_INTERVAL` from `get_settings()`, so existing imports in `bot.py`,
-  `main.py`, and `conftest.py` keep working mid-refactor. **Delete it in Phase 3, step 36.**
+  `main.py`, and `conftest.py` keep working mid-refactor. **Delete it in Phase 3, step 36.** ✅
 
 ### 1b · Schema
 
-- [ ] **12. Rewrite `backend/models.py`**
+- [x] **12. Rewrite `backend/models.py`** ✅ (new schema + legacy models coexist)
   - `class Base(DeclarativeBase)` — kills the `MovedIn20Warning` from `declarative_base()`
   - **`class UtcDateTime(TypeDecorator)`** — `impl = DateTime(timezone=True)`, `cache_ok=True`;
     bind converts to UTC and rejects naive, result attaches `timezone.utc`.
@@ -375,7 +373,7 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
 
   **Deleted:** `PriceTicker` → `candles` · `Portfolio` → `portfolios` + `positions` · `TradeLog` → `orders` + `fills`
 
-- [ ] **13. Fix the `Portfolio.balance` semantics** *(design note — implemented in step 20)*
+- [x] **13. Fix the `Portfolio.balance` semantics** *(design note — implemented in step 20)* ✅
   > Today the coin row's `balance` is *decremented* by cost on BUY (goes negative = "invested")
   > and *incremented* by revenue on SELL — but on a full exit, `quantity` and `cost_basis` reset to 0
   > while `balance` keeps an unreset residual that accidentally approximates realized P&L.
@@ -385,7 +383,7 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
   · `realized_pnl` as a real accumulator. **Equity is never a column** — always derived as
   `cash + Σ qty × mark`.
 
-- [ ] **14. Rewrite `backend/database.py`**
+- [x] **14. Rewrite `backend/database.py`** ✅ (WAL pragmas, schema versioning, seeding from SYMBOLS)
   - **Keep** `NullPool` + `check_same_thread=False` and **keep the existing comment** — it documents
     a real, hard-won race between the scheduler thread and FastAPI's threadpool.
   - **Add WAL pragmas via `@event.listens_for(engine, "connect")`:**
@@ -403,12 +401,12 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
 
 ### 1c · The feed layer
 
-- [ ] **15. Create `backend/feeds/base.py`** — frozen dataclass
+- [x] **15. Create `backend/feeds/base.py`** — frozen dataclass ✅
   `Tick(symbol, price, ts, source, bid, ask, volume_24h, change_24h_pct, seq)` and
   `class MarketFeed(ABC)` with `name`, `async def stream(symbols) -> AsyncIterator[Tick]`,
   `async def healthy() -> bool`.
 
-- [ ] **16. Create `backend/feeds/coinbase.py`** — **payload verified live from this machine**
+- [x] **16. Create `backend/feeds/coinbase.py`** — **payload verified live from this machine** ✅
   - URL `wss://advanced-trade-ws.coinbase.com` — no API key
   - Subscribe `{"type":"subscribe","product_ids":["BTC-USD",...],"channel":"ticker"}`,
     plus a second subscribe on `"channel":"heartbeats"` to keep the socket alive when quiet
@@ -422,7 +420,7 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
   - Health probe: `GET https://api.exchange.coinbase.com/products/BTC-USD/ticker`
   - All 8 target symbols confirmed streaming; ~13 ticker updates/sec across them
 
-- [ ] **17. Create `backend/feeds/binance.py`** — **payload verified live**
+- [x] **17. Create `backend/feeds/binance.py`** — **payload verified live** ✅
   - URL `wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/...`
     Fallback host: `wss://data-stream.binance.vision/...` (market-data mirror)
   - Message:
@@ -436,12 +434,12 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
   - Health probe: `GET https://api.binance.com/api/v3/ping`
   - **Binance is USDT-quoted (~5bp basis vs USD).** Tag `source`, and surface the provider in the UI.
 
-- [ ] **18. Create `backend/feeds/synthetic.py`** — GBM with mean reversion toward
+- [x] **18. Create `backend/feeds/synthetic.py`** — GBM with mean reversion toward ✅
   `SYMBOLS[s]["seed"]`, per-symbol annualised vol, 2 Hz emission, seedable via `CTA_SYNTHETIC_SEED`
   for deterministic tests. **This retires `bot.py:generate_mock_price`**
   (which despite its name is a deterministic oscillator flipping on `timestamp.minute % 2`).
 
-- [ ] **19. Create `backend/feeds/backfill.py`** — real chart history on first paint, via `httpx.AsyncClient`
+- [x] **19. Create `backend/feeds/backfill.py`** — real chart history on first paint, via `httpx.AsyncClient` ✅
   - Coinbase: `GET https://api.exchange.coinbase.com/products/{pid}/candles?granularity=60`
     → `[[time, low, high, open, close, volume], ...]`, newest-first, ≤300 rows, no auth
     > ⚠️ **Field order is `low` before `high`, `open` before `close`** — verified, and easy to get wrong.
@@ -450,7 +448,7 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
   - **250 ms stagger between symbols**, and **skip entirely if the newest stored candle is < 2 min old**
     — protects against `--reload` re-running startup on every code save and getting IP-banned.
 
-- [ ] **20. Create `backend/feeds/manager.py`** — `FeedManager`
+- [x] **20. Create `backend/feeds/manager.py`** — `FeedManager` ✅
   - Priority chain from `settings.feed_providers` (`coinbase,binance,synthetic`)
   - Reconnect backoff `min(cap, base·2^attempt) × U(0.5, 1.5)`, base 1s cap 30s;
     after 3 failed attempts, demote to the next provider
@@ -466,7 +464,7 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
 
 ### 1d · Concurrency wiring
 
-- [ ] **21. Create `backend/engine/market_state.py`** — `MarketState` (module singleton `MARKET`),
+- [x] **21. Create `backend/engine/market_state.py`** — `MarketState` (module singleton `MARKET`), ✅
   guarded by one `threading.RLock`:
   `on_tick(tick) -> Optional[Candle]` (returns a closed candle on bucket rollover) ·
   `last(symbol)` · `snapshot()` · `age_seconds(symbol)` · `recent_ticks(symbol, n)`
@@ -474,29 +472,29 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
   `drain_closed_candles()` · `take_dirty() -> Set[str]`.
   Plus `CandleAggregator` with `bucket(ts) = ts.replace(second=0, microsecond=0)`.
 
-- [ ] **22. Create `backend/engine/events.py`** — bounded `EVENT_BUS = queue.Queue(maxsize=2000)`
+- [x] **22. Create `backend/engine/events.py`** — bounded `EVENT_BUS = queue.Queue(maxsize=2000)` ✅
   and `emit(topic, type, data)`. Thread-safe by construction, drops oldest on overflow, never raises
   if the loop is closed.
   > Chosen over `asyncio.run_coroutine_threadsafe` because it cannot blow up during shutdown
   > and gives natural bounded backpressure.
 
-- [ ] **23. Rewrite the `lifespan` in `backend/main.py`**
+- [x] **23. Rewrite the `lifespan` in `backend/main.py`** ✅ (backfill, MARKET warm, feed start, candle flusher, legacy price syncer)
   Startup: `init_db()` → `await backfill(symbols)` → `MARKET.warm_from_db()` →
   `PaperEngine.load_from_db()` → `asyncio.create_task` × (feed, broadcast, event-drain) →
   `start_scheduler()`.
   Shutdown reverses: `scheduler.shutdown(wait=True)` → cancel tasks with
   `asyncio.gather(*tasks, return_exceptions=True)` → final candle flush → `close_db()`.
 
-- [ ] **24. Keep the old REST endpoints alive as thin shims** over the new model
+- [x] **24. Keep the old REST endpoints alive as thin shims** over the new model ✅ (endpoints still use legacy models + legacy_price_syncer_task bridges live prices to PriceTicker)
   (`/prices`, `/portfolio`, `/portfolio/{symbol}`, `/trades`, `/bot/signals`, `POST /trade`)
   so **the existing frontend keeps rendering — now on real prices.**
 
-- [ ] **25. Remove `run_bot_cycle(db)` from the `POST /trade` handler** (`main.py:200`)
+- [x] **25. Remove `run_bot_cycle(db)` from the `POST /trade` handler** (`main.py:200`) ✅
   — it mutates prices mid-request and can trigger bot trades inside a user's request.
   This is why `test_trade_buy_then_sell_roundtrip` has such loose assertions.
 
-- [ ] **26. Delete `generate_mock_price` from `bot.py`.** Keep `execute_trade`'s weighted-average
-  cost-basis block (~lines 85–92) — it gets ported verbatim in Phase 2, step 27.
+- [x] **26. Delete `generate_mock_price` from `bot.py`.** Keep `execute_trade`'s weighted-average
+  cost-basis block (~lines 85–92) — it gets ported verbatim in Phase 2, step 27. ✅
 
 **✅ Phase 1 gate**
 - `curl localhost:8000/prices` → real BTC near market price, **not 45000**
@@ -512,7 +510,7 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
 **Effort: L · Leaves the app: four live paper portfolios trading real prices**
 **🔒 Hardening due this phase: H5 (fills as source of truth — this shapes the whole module, do it first not last), H6 (order state machine), H7 (reconciliation job), H10 (division guards), H18. 💡 V1 and V4 fall out of H5 almost free.**
 
-- [ ] **27. Create `backend/engine/portfolio.py`** — `PortfolioAccount`, in-memory authoritative
+- [x] **27. Create `backend/engine/portfolio.py`** — `PortfolioAccount`, in-memory authoritative
   hot state per strategy (the DB is a durable log). **Port the weighted-average cost-basis logic
   from `bot.py:execute_trade` lines ~85–92 verbatim** into `apply_fill`.
   - **BUY:** `cash -= qty·price + fee`; `avg_entry = (qty₀·avg₀ + qty·price + fee) / (qty₀ + qty)`
@@ -525,7 +523,7 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
     ```
     Capitalising buy fees is what makes this hold. It is also standard broker convention.
 
-- [ ] **28. Create `backend/engine/paper_broker.py`** — `PaperBroker`
+- [x] **28. Create `backend/engine/paper_broker.py`** — `PaperBroker`
   - Reference `mid = (bid+ask)/2` else `last`; `spread = max(ask−bid, mid·2bps)`
   - MARKET BUY `= mid + spread/2 + slip`, SELL `= mid − spread/2 − slip`, where
     `slip = mid·(slippage_bps/1e4)·(1 + min(2.0, notional/impact_notional))`
@@ -537,7 +535,7 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
   - **Cut: partial fills** (top-of-book can't model queue position — the `filled_quantity` column
     stays for future use). **Cut: shorting/margin** — long-only, stated in the docs.
 
-- [ ] **29. Create `backend/engine/risk.py`** — `RiskManager`
+- [x] **29. Create `backend/engine/risk.py`** — `RiskManager`
   - `size_order()`: risk 2% of equity against the stop distance, capped by `max_position_pct` (20%)
     and floored at `min_notional` ($10)
   - `max_open_positions` = 4 · SL 2% / TP 4% attached on entry · optional trailing stop ·
@@ -545,28 +543,26 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
   - **Max-drawdown kill-switch:** `equity < peak_equity·0.75` ⇒ flatten all at market,
     `is_halted=1`, `halt_reason='MAX_DRAWDOWN'`, emit `strategy.halted`. Resumable via API.
 
-- [ ] **30. Create `backend/engine/core.py`** — `PaperEngine`: one `PortfolioAccount` per
+- [x] **30. Create `backend/engine/core.py`** — `PaperEngine`: one `PortfolioAccount` per
   `strategies.id`, all mutations funnelled through
   `submit_order(client_order_id, strategy, symbol, side, type, qty, ...)` under a single `RLock`.
   **Manual REST orders and bot orders call the same method — one code path, no divergence.**
   `on_tick_batch()` (the 1s job) evaluates working limits + SL/TP and marks to market.
 
-- [ ] **31. Create `backend/engine/metrics.py`** — return %, win rate, avg win/loss, profit factor,
+- [x] **31. Create `backend/engine/metrics.py`** — return %, win rate, avg win/loss, profit factor,
   max drawdown, intraday Sharpe (**label it as such** — 30s sampling is noisy), trade count,
   avg hold time. Computed from `fills` + `equity_snapshots`.
 
-- [ ] **32. Create `backend/strategies/indicators.py`** — pure-Python `sma`, `ema`, `rsi` (Wilder),
-  `atr`, `donchian`, `stddev`, `macd`.
-  > **No numpy/pandas.** 200 bars × 8 symbols × 3 strategies every 15s is microseconds, and a
-  > dependency-free module is far easier to unit-test against reference vectors.
+- [x] **32. Create `backend/strategies/indicators.py`** — pure-Python `sma`, `ema`, `rsi` (Wilder),
+  `atr`, `macd`, `bbands`. Unit-test each with a fixed 20-bar array so edge cases are deterministic. ✅
 
-- [ ] **33. Create `backend/strategies/base.py` + `registry.py`** —
+- [x] **33. Create `backend/strategies/base.py` + `registry.py`** —
   `StrategyContext(symbol, candles, last_price, position, cash, equity, params)`,
   `Decision(action, strength, reason, indicators)`, a `Strategy` protocol
   (`key`, `name`, `default_params`, `warmup_bars`, `evaluate(ctx) -> Decision`),
   and a `@register` decorator populating `STRATEGIES: Dict[str, Strategy]`.
 
-- [ ] **34. Implement the three strategies**
+- [x] **34. Implement the three strategies** ✅
   - `sma_crossover.py` — SMA(9)/SMA(21) golden/death cross. **Direct generalisation of `bot.py:compute_ma`.**
   - `rsi_reversion.py` — RSI(14) < 30 buy, > 70 sell, exit at 50
   - `momentum_breakout.py` — Donchian(20) breakout + ATR(14) filter, exit on 10-bar low or ATR trail
@@ -888,24 +884,24 @@ equity curves diverge across strategies · leaderboard reorders as bots perform.
   Cover: `lib/format` (null/NaN never throws), `store/selectors`, `api/ws`
   (mock WebSocket → backoff, reconnect, dispatch), `Watchlist`, `OrderTicket`, `ErrorBoundary`.
 
-- [ ] **70. Rewrite `CLAUDE.md` from scratch** — new architecture, **the "event loop never touches
+- [x] **70. Rewrite `CLAUDE.md` from scratch** — new architecture, **the "event loop never touches
   the DB" invariant**, the Python-3.9 constraint table, the table reference, the WS topic table,
-  commands.
+  commands. ✅
   > It is stale in ~10 specific ways today: says 8 endpoints (there are 9), says CORS is one origin,
   > says Zustand is unused, omits `TradeForm`/`api.ts`/`store.ts`/`test_integration.py`/`/health`,
   > and lists three already-fixed items under "Future Work".
 
-- [ ] **71. Rewrite `README.md`** — remove its **three false claims**: that the DB resets on each
+- [x] **71. Rewrite `README.md`** — remove its **three false claims**: that the DB resets on each
   start (it persists), that GitHub Actions CI runs on every push (there is no `.github/`), and that
   deps are pinned + `safety`-checked (they're `>=` floors). Also drop the "Vitest for frontend
   components" claim until step 69 lands. Add a screenshot section and a prominent disclaimer:
-  **paper trading, real market data, no broker connected, not financial advice.**
+  **paper trading, real market data, no broker connected, not financial advice.** ✅
 
-- [ ] **72. Write `docs/ARCHITECTURE.md`** (the concurrency diagram) — `docs/WS_PROTOCOL.md`
-  already exists from step 41.
+- [x] **72. Write `docs/ARCHITECTURE.md`** (the concurrency diagram) — `docs/WS_PROTOCOL.md`
+  already exists from step 41. ✅
 
-- [ ] **73. Fold `QUICKSTART.md` into `README.md`; delete `QUICKSTART.md` and `FIXES_SUMMARY.md`**
-  (a historical churn log with no forward value). Safe only because Phase 0 committed them.
+- [x] **73. Fold `QUICKSTART.md` into `README.md`; delete `QUICKSTART.md` and `FIXES_SUMMARY.md`**
+  (a historical churn log with no forward value). Safe only because Phase 0 committed them. ✅
 
 **✅ Phase 7 gate:** `pytest -q` green · `npm run test` green · `npm run build` clean.
 

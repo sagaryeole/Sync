@@ -1,195 +1,206 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with code in this repository.
 
 ## Quick Start
 
-This is a monorepo with independent backend (FastAPI) and frontend (React) directories. Each has its own package manager and dev server.
-
-### Backend (Python/FastAPI)
-
+### Backend
 ```bash
-# Install dependencies
-cd backend && pip install -r requirements.txt
-
-# Run the server (with hot reload)
-cd backend && uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-
-# Run tests
-cd backend && pytest
-
-# Run a single test
-cd backend && pytest tests/test_api.py::test_list_assets -v
-
-# Format & lint
-cd backend && black . && isort . && flake8
+cd backend
+pip install -r requirements.txt
+python3 -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+python3 -m pytest -q
 ```
 
-### Frontend (React/Vite)
-
+### Frontend
 ```bash
-# Install dependencies
-cd frontend && npm install
-
-# Run dev server
-cd frontend && npm run dev
-
-# Build for production
-cd frontend && npm run build
-
-# Lint
-cd frontend && npm run lint
+cd frontend
+npm install
+npm run dev
+npm run lint
 ```
 
 ## Architecture
 
-### Backend Architecture
+### Backend (FastAPI + SQLAlchemy)
 
-**Core Components:**
-- `main.py` – FastAPI app with 8 REST endpoints for assets, prices, portfolio, trades, and bot signals
-- `bot.py` – Background scheduler loop running bot trades via **moving average crossover strategy**; imports `Portfolio` and `TradeLog` models but the actual execute_trade logic is in bot.py
-- `models.py` – SQLAlchemy ORM: Asset, PriceTicker, Portfolio, TradeLog
-- `database.py` – Session management and DB initialization (SQLite)
-- `config.py` – Constants: assets (BTC, ETH, SOL), scheduler interval (60s), bot MA period (5 min), CORS/DB URLs
+**Request lifecycle:**
+1. FastAPI receives REST request
+2. Route handler opens a DB session via `get_db()`
+3. Engine / feed / bot code runs **without touching the DB directly**
+4. Session is closed after response
 
-**Key Trade Logic Flow:**
-1. Bot scheduler runs `run_bot_cycle()` every 60 seconds
-2. `generate_mock_price()` adds a new price point using volatility-based random walk (no trend)
-3. `get_signal()` computes SMA over 5 min window; returns "BUY" if price < 98% of MA, "SELL" if > 102% of MA
-4. `execute_trade()` updates Portfolio (add/remove quantity, adjust USD balance) and logs to TradeLog
-5. Bot only trades $100 per cycle (or all holdings on SELL) if signal and balance conditions met
+**Invariant:** The event loop / engine core never opens its own SQLAlchemy sessions. All persistence goes through the request-scoped `get_db()` dependency or explicitly passed sessions.
 
-**CORS:** Hardcoded to `http://localhost:5173` (frontend dev server)
+**Core components:**
+- `main.py` – FastAPI app with 9 REST endpoints, CORS middleware, lifespan startup/shutdown
+- `settings.py` – Pydantic-settings config (env-prefixed `CTA_`), `.env` supported
+- `config.py` – Backward-compat shim exporting `settings` values
+- `database.py` – SQLAlchemy engine, `SessionLocal`, `get_session()`, `init_db()`, `close_db()`
+- `models.py` – ORM: `Asset`, `PriceTicker`, `Portfolio`, `TradeLog`, `Candle`, `Strategy`, `PortfolioAccount`, `Position`, `Fill`, `Order`, `Signal`, `EquitySnapshot`
+- `bot.py` – Legacy compatibility shim (`run_bot_cycle`, `get_signal`, `start_bot`, `execute_trade`, `prune_old_prices`); actual trading logic lives in `engine/`
+- `feeds/` – Market data ingestion (Coinbase, Binance, synthetic, recorder, backfill, validation, manager)
+- `engine/` – Paper trading engine (`core.py`), broker (`paper_broker.py`), risk (`risk.py`), portfolio (`portfolio.py`), metrics (`metrics.py`), market state (`market_state.py`)
+- `strategies/` – Trading strategies
 
-### Frontend Architecture
+**Startup sequence (lifespan):**
+1. `init_db()` — create tables
+2. `backfill_candles()` — REST backfill for recent candles
+3. `MARKET.warm_from_db()` — warm in-memory state from DB
+4. `start_bot()` — legacy APScheduler bot cycle
+5. `feed_manager.start()` — live WebSocket streaming
+6. `candle_flusher_task()` — background task flushing closed candles to DB
+7. `legacy_price_syncer_task()` — background task syncing ticks to legacy `PriceTicker` table
 
-**React + Vite + TypeScript:**
-- Entry: `src/main.tsx` → `src/App.tsx`
-- Components in `src/components/`:
-  - `Dashboard.tsx` – Top-level layout with nav, displays current prices and portfolio value
-  - `PriceTable.tsx` – Historical price data; fetches `/prices` endpoint
-  - `Portfolio.tsx` – User holdings (quantity, balance, cost basis); fetches `/portfolio?symbol=<SYMBOL>` for each asset
-- State: Zustand store (not yet fully integrated in existing tests/components; see imports in test expectations)
-- HTTP: axios to `http://localhost:8000` (backend)
-- Routes: React Router (installed but basic setup in App.tsx)
+**Shutdown sequence (reverse):**
+1. Stop APScheduler
+2. Cancel background tasks
+3. Final candle flush
+4. `feed_manager.stop()`
+5. `close_db()`
 
-### Data Model
+### Frontend (React + Vite + TypeScript)
 
-**SQLite Tables:**
-- `assets` – Static: BTC, ETH, SOL (id, symbol, name)
-- `prices` – Time series: symbol, price, timestamp (indexed on symbol)
-- `portfolios` – User holdings per asset: symbol (PK), balance (USD), quantity (coins), cost_basis
-- `trades` – Log: id, type (BUY/SELL), symbol, quantity, price, timestamp
+**Stack:** React 18, Vite 5, TypeScript 5, Axios, React Router 6, Zustand 4, ESLint.
 
-## Key Design Notes
+**Entry:** `src/main.tsx` → `src/App.tsx`
 
-### Bot Strategy
-- **Simple MA Crossover:** Current price vs. 5-min SMA; no ML or complex features
-- **Budget:** $100 USD per BUY trade (capped by balance); full holdings on SELL
-- **Volatility:** BTC ±1%, ETH ±1.5%, SOL ±2.5% per cycle; controlled in `generate_mock_price()`
-- **DB Reset:** SQLite in-memory/local file reset on app startup; no persistence across restarts
+**State:** `src/store.ts` — Zustand store with `fetchAll()`, `executeTrade()`, and per-endpoint selectors.
 
-### API Design
-- Request validation via Pydantic (symbol regex patterns, quantity >= 0)
-- Responses are mostly Pydantic models mapped from SQLAlchemy ORM
-- `/trade` endpoint refreshes prices and re-runs bot logic in-process (not asynchronous)
-- `/bot/signals` returns live signal for each asset (useful for testing/debugging)
+**HTTP:** `src/api.ts` — Axios instance pointing to `http://localhost:8000`.
 
-### Backend Imports Matter
-- `from bot import run_bot_cycle, get_signal, generate_mock_price` – These three are key exports
-- `from database import get_session, init_db, close_db` – DB lifecycle
-- `from models import Asset, PriceTicker, Portfolio, TradeLog` – ORM models
-- Tests mock/patch the Session and use in-memory tables
+**Components:**
+- `Dashboard.tsx` — Top-level layout
+- `PriceTable.tsx` — Historical price data
+- `Portfolio.tsx` — User holdings
+- `TradeForm.tsx` — Manual trade entry
 
-## Testing
+**Routes:** React Router (basic setup in `App.tsx`).
 
-### Backend Tests
-- **Framework:** pytest (run from `backend/` directory)
-- **Setup:** `test_db` fixture creates fresh in-memory DB per test, cleans up after
-- **Coverage:** `test_api.py` (8 endpoint tests), `test_bot.py` (4 bot logic tests)
-- **Patterns:** Use `Session()` for DB access, mock PriceTicker/Portfolio with plain objects where needed
-- **Note:** Tests may use deprecated or mocked `should_buy()` function—verify actual function name in bot.py is `get_signal()`
+## REST Endpoints
 
-### Frontend Tests
-- No Jest/Vitest tests yet; linter is eslint (run `npm run lint`)
-- Components are simple; prop-drilling from App → Dashboard → Portfolio/PriceTable
-- No mocking of axios calls in existing tests; real HTTP on localhost:8000
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Provider + mode status |
+| GET | `/assets` | List all assets |
+| GET | `/assets/{symbol}` | Get single asset |
+| GET | `/prices` | Recent price tickers (newest-first, max 100) |
+| GET | `/portfolio` | List all portfolio positions |
+| GET | `/portfolio/{symbol}` | Get single position |
+| POST | `/trade` | Execute BUY/SELL trade |
+| GET | `/trades` | Trade log (paginated, max 1000) |
+| GET | `/bot/signals` | Current signals per asset |
 
-## Common Tasks
+**Request validation:** Pydantic `Field(pattern=...)` for symbols/types; `ge=0` for quantity.
 
-### Add a New Endpoint
-1. Define Pydantic request/response models in `main.py` or a `schemas.py` if models grow
-2. Implement route with `@app.get()` or `@app.post()`; dependency-inject `db: Session`
-3. Add test in `tests/test_api.py`
-4. If it triggers bot logic, call `run_bot_cycle(db)` or specific bot functions
+**Response model:** Separate Pydantic response models; SQLAlchemy models stay in `models.py`.
 
-### Modify Bot Strategy
-- Edit `get_signal()` in `bot.py` to change buy/sell thresholds (currently ±2%)
-- Edit `run_bot_cycle()` to change trade amount ($100) or conditions
-- Adjust `BOT_PERIOD` in `config.py` for MA window size (currently 5 min)
-- Run `pytest tests/test_bot.py` to verify logic
+## Data Model
 
-### Add a Frontend Component
-1. Create `.tsx` file in `src/components/`
-2. Use axios to call backend endpoints (base URL: `http://localhost:8000`)
-3. Wire into App.tsx route or Dashboard layout
-4. Run `npm run lint` to check TypeScript and ESLint
+### Legacy tables
+| Table | Columns | Notes |
+|-------|---------|-------|
+| `assets` | `id`, `symbol`, `name` | Static seed data |
+| `prices` | `id`, `symbol`, `price`, `timestamp` | Legacy ticker table, synced from `MARKET` |
+| `portfolios` | `symbol` (PK), `balance`, `quantity`, `cost_basis` | Legacy per-coin portfolio |
+| `trades_legacy` | `id`, `type`, `symbol`, `quantity`, `price`, `timestamp` | Legacy trade log |
 
-## Dev Workflow
+### Engine tables
+| Table | Columns | Notes |
+|-------|---------|-------|
+| `strategies` | `id`, `key`, `name`, `description`, `enabled`, `params_json`, `starting_cash`, `created_at` | |
+| `portfolios` | `id`, `strategy_id` (FK), `cash`, `realized_pnl`, `fees_paid`, `peak_equity`, `is_halted`, `halt_reason`, `updated_at` | One per strategy |
+| `positions` | `id`, `strategy_id` (FK), `symbol`, `quantity`, `avg_entry_price`, `stop_loss_price`, `take_profit_price`, `opened_at`, `updated_at` | |
+| `orders` | `id`, `strategy_id` (FK), `client_order_id` (unique), `symbol`, `side`, `type`, `status`, `quantity`, `limit_price`, `stop_price`, `filled_quantity`, `filled_price`, `fee`, `reject_reason`, `time_in_force`, `created_at`, `updated_at` | |
+| `fills` | `id`, `strategy_id` (FK), `order_id`, `client_order_id`, `symbol`, `side`, `quantity`, `price`, `fee`, `order_type`, `ts` | Append-only |
+| `candles` | `id`, `symbol`, `interval`, `open_time` (UK), `open`, `high`, `low`, `close`, `volume`, `trades`, `source` | 1m bars |
+| `equity_snapshots` | `id`, `strategy_id` (FK), `ts`, `equity`, `cash`, `position_value`, `realized_pnl`, `unrealized_pnl`, `drawdown_pct` | |
+| `signals` | `id`, `strategy_id` (FK), `symbol`, `action`, `strength`, `price`, `indicators_json`, `ts` | |
 
-1. **Terminal 1 (Backend):**
-   ```bash
-   cd backend
-   pip install -r requirements.txt  # one-time
-   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-   ```
+**Indexes:** `prices.symbol`, `candles.(symbol, interval, open_time)` (unique + desc index), `equity_snapshots.ts`.
 
-2. **Terminal 2 (Frontend):**
-   ```bash
-   cd frontend
-   npm install  # one-time
-   npm run dev
-   ```
+## Engine Design
 
-3. **Browser:** Open `http://localhost:5173` (Vite dev server)
+### MarketState (thread-safe hot state)
+- In-memory last-tick price, tick history (`deque` per symbol, maxlen 600)
+- Open/closed 1m candle aggregation
+- `drain_closed_candles()` returns rolled candles for DB flush
+- `close_all_candles()` forces close on provider switch/shutdown
 
-4. **Testing:** In a third terminal, run:
-   ```bash
-   cd backend && pytest -v
-   cd frontend && npm run lint
-   ```
+### PaperBroker
+- MARKET: taker fill at mid + spread/2 + slippage
+- LIMIT: maker fill when crossed
+- STOP: triggers on last price, converts to MARKET
+- Fees: taker 10 bps / maker 4 bps
+- Rejects: insufficient cash/position, below min notional, max positions, stale price, non-tradable symbol
 
-## Dependencies
+### RiskManager
+- `size_order()`: risk 2% of equity / stop distance, capped at 20% notional, floored at min notional ($10)
+- SL 2% / TP 4% attached on entry
+- Max open positions: 4
+- Cooldown: 3 bars after close
+- Kill-switch: drawdown > 25% → halt + flatten
 
-**Backend:**
-- FastAPI 0.111+: Web framework
-- Uvicorn 0.30+: ASGI server
-- SQLAlchemy 2.0+: ORM
-- Pydantic 2.8+: Request validation
-- APScheduler 3.10+: Background scheduler for bot cycle
+### Metrics
+- Pure functions over fills + equity snapshots
+- `win_rate`, `avg_win`, `avg_loss`, `profit_factor`, `max_drawdown_pct`, `intraday_sharpe`, `trade_count`, `avg_hold_time_seconds`
+- H1/H10: all divisions guarded via `_safe_div`; never returns inf/NaN
 
-**Frontend:**
-- React 18.3+: UI library
-- Vite 5.2+: Build tool
-- TypeScript 5.4+: Language
-- Axios 1.7+: HTTP client
-- React Router 6.24+: Routing
-- Zustand 4.5+: State management (installed, may not be fully used)
-- ESLint 8.57+: Linting
+## Feeds
 
-## Environment & Defaults
+### Providers
+- **Coinbase** — REST backfill + WebSocket ticker
+- **Binance** — REST backfill + WebSocket ticker
+- **Synthetic** — OU/GBM random walk for offline testing
 
-- **Backend Port:** 8000 (hardcoded in uvicorn commands)
-- **Frontend Port:** 5173 (Vite default)
-- **DB:** SQLite at `backend/crypto.db` (local file)
-- **Bot Scheduler:** Runs every 60 seconds (`config.SCHEDULER_INTERVAL`)
-- **CORS Origin:** Hardcoded to `http://localhost:5173` in main.py middleware
+### Manager
+- Auto-failover: primary → secondary on repeated failure
+- Failback probe every 120s
+- Per-tick validation (H1: NaN/Inf/stale; H4: sanity band with confirmation)
+
+### Validation
+- Reject NaN/Inf/non-positive prices
+- Reject stale (>20s) or future timestamps
+- H4: reject single-tick moves >10% unless 2 consecutive confirmations
+
+## Python Constraints
+
+- **Target:** Python 3.9+
+- **No f-strings in logging** — use `%` formatting to avoid `AttributeError` on custom log handlers
+- **Decimal-safe:** convert SQLAlchemy `Numeric` to `float` before arithmetic
+- **Thread safety:** `MarketState` uses `threading.RLock`; engine core uses its own lock
+- **Async boundaries:** only `main.py` and `feeds/` use `async/await`; engine/bot are synchronous
+
+## Environment
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CTA_DATABASE_URL` | `sqlite:///./crypto.db` | DB connection string |
+| `CTA_CORS_ORIGINS` | `http://localhost:3000,http://localhost:5173,...` | Comma-separated allowed origins |
+| `CTA_SYMBOLS` | `BTC,ETH,SOL,XRP,ADA,DOGE,AVAX,LINK` | Traded symbols |
+| `CTA_STARTING_CASH` | `100000.0` | Default strategy equity |
+| `CTA_HOST` | `127.0.0.1` | Bind address (set `0.0.0.0` for LAN) |
+
+## Commands
+
+```bash
+# Backend
+cd backend
+pip install -r requirements.txt
+python3 -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+python3 -m pytest -q
+python3 -m pytest tests/test_engine_core.py -v
+
+# Frontend
+cd frontend
+npm install
+npm run dev
+npm run lint
+npm run build
+```
 
 ## Notes for Future Work
 
-- **Scheduler cleanup:** The bot starts a background APScheduler on app startup but is not explicitly stopped on shutdown; consider adding proper lifecycle management
-- **DB queries:** Some queries manually order by timestamp desc and limit; consider adding query helpers to reduce repetition
-- **Cost basis logic:** Portfolio cost_basis calculation in `execute_trade()` SELL branch may have a bug (redundant recalculation); verify and fix
-- **Frontend state:** Zustand store is installed but components use props; migrate to centralized state if app grows
-- **Error handling:** Frontend components don't handle HTTP errors gracefully (no try/catch or error boundaries)
-- **Tests:** Some test imports reference functions that may not exist (e.g., `should_buy` vs `get_signal`); audit test suite
+- **WebSocket:** `docs/WS_PROTOCOL.md` is planned (step 41); no WS endpoint exists yet
+- **Frontend tests:** No Jest/Vitest configured yet; `store/selectors`, `api/ws`, `Watchlist`, `OrderTicket`, `ErrorBoundary` need coverage
+- **Legacy bot:** `bot.py` is a compatibility shim; the engine in `engine/core.py` is the production path

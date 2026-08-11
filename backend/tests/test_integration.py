@@ -1,11 +1,11 @@
 """Integration tests for the new improvements: /trade execution, /portfolio list-all,
-bot cycle, health check, and price pruning."""
+health check, and price pruning."""
 import pytest
 from fastapi.testclient import TestClient
-from main import app
+from main import app, _legacy_execute_trade as execute_trade
 from database import get_session
 from models import PriceTicker, Portfolio, TradeLog
-from bot import execute_trade, run_bot_cycle, prune_old_prices
+from scheduler import _make_prune_job
 from datetime import datetime, timezone, timedelta
 
 client = TestClient(app)
@@ -22,7 +22,20 @@ def test_db():
 def test_health_check():
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok"}
+    data = r.json()
+    assert data["status"] == "ok"
+
+
+def test_health_does_not_leak_config():
+    """H15: /health must not leak config — no env dump, no DB path, no origin list."""
+    r = client.get("/health")
+    assert r.status_code == 200
+    data = r.json()
+    forbidden = {"database_url", "cors_origins", "env", "config", "origin", "origins",
+                 "secret", "key", "token", "password", ".env", "db_path", "db_url",
+                 "settings", "env_file"}
+    leaked = forbidden.intersection(data.keys())
+    assert not leaked, f"/health leaked config keys: {leaked}"
 
 
 # ---- GET /portfolio (list-all) ----
@@ -130,68 +143,15 @@ def test_trade_buy_then_sell_roundtrip():
     assert usd_end > 0
 
 
-# ---- Bot cycle ----
-
-def test_run_bot_cycle_generates_prices():
-    """run_bot_cycle should add new price records for all assets."""
-    import config
-    session = get_session()
-    prices_before = session.query(PriceTicker).count()
-    session.close()
-
-    run_bot_cycle(get_session())
-
-    session = get_session()
-    prices_after = session.query(PriceTicker).count()
-    session.close()
-
-    # Should have added at least one price per asset
-    assert prices_after >= prices_before + len(config.ASSETS)
-
-
-def test_run_bot_cycle_logs_trades_on_signal():
-    """When a BUY signal triggers, a trade should be logged and USD deducted."""
-    import random
-    session = get_session()
-
-    # Create a strong downtrend to trigger BUY (price < 98% of MA)
-    # First add 5 high prices to establish MA
-    for i in range(5):
-        session.add(PriceTicker(symbol="BTC", price=50000 + i * 100,
-                                timestamp=datetime.now(timezone.utc)))
-    session.commit()
-    # Now add a low price (well below 98% of MA ~ 50200)
-    session.add(PriceTicker(symbol="BTC", price=40000, timestamp=datetime.now(timezone.utc)))
-    session.commit()
-
-    # Ensure USD balance for the bot to trade
-    usd = session.query(Portfolio).filter_by(symbol="USD").first()
-    usd.balance = 10000
-    session.commit()
-
-    trades_before = session.query(TradeLog).count()
-    session.close()
-
-    run_bot_cycle(get_session())
-
-    session = get_session()
-    trades_after = session.query(TradeLog).count()
-    usd_after = float(session.query(Portfolio).filter_by(symbol="USD").first().balance)
-    session.close()
-
-    # A BUY trade should have been logged
-    assert trades_after > trades_before
-    # USD should have decreased by ~$100 (bot buys $100 worth)
-    assert usd_after < 10000
-
-
 # ---- Price pruning ----
+# The legacy MA-crossover bot cycle (bot.py:run_bot_cycle) is gone — replaced by
+# the engine + StrategyRunner (see engine/runner.py, scheduler.py). Pruning is
+# now the scheduler's hourly `prune` job, tested directly here.
 
-def test_prune_old_prices_deletes_old_records():
-    """prune_old_prices should remove records older than max_age_hours."""
+def test_prune_job_deletes_old_prices():
+    """The prune job should remove PriceTicker rows older than 24h."""
     session = get_session()
 
-    # Add an old price record (48 hours ago)
     old_time = datetime.now(timezone.utc) - timedelta(hours=48)
     session.add(PriceTicker(symbol="BTC", price=10000, timestamp=old_time))
     session.commit()
@@ -200,11 +160,9 @@ def test_prune_old_prices_deletes_old_records():
         PriceTicker.timestamp < datetime.now(timezone.utc) - timedelta(hours=24)
     ).count()
     assert old_count > 0
-
     session.close()
 
-    # Prune with 24-hour retention
-    prune_old_prices(get_session(), max_age_hours=24)
+    _make_prune_job()()
 
     session = get_session()
     remaining_old = session.query(PriceTicker).filter(
@@ -215,15 +173,15 @@ def test_prune_old_prices_deletes_old_records():
     assert remaining_old == 0
 
 
-def test_prune_old_prices_keeps_recent():
-    """prune_old_prices should NOT remove recent records."""
+def test_prune_job_keeps_recent_prices():
+    """The prune job should NOT remove recent PriceTicker rows."""
     session = get_session()
     recent_count_before = session.query(PriceTicker).filter(
         PriceTicker.timestamp >= datetime.now(timezone.utc) - timedelta(hours=24)
     ).count()
     session.close()
 
-    prune_old_prices(get_session(), max_age_hours=24)
+    _make_prune_job()()
 
     session = get_session()
     recent_count_after = session.query(PriceTicker).filter(
