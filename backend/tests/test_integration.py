@@ -2,7 +2,8 @@
 health check, and price pruning."""
 import pytest
 from fastapi.testclient import TestClient
-from main import app, _legacy_execute_trade as execute_trade
+from main import app
+from api.trading import _legacy_execute_trade as execute_trade
 from database import get_session
 from models import PriceTicker, Portfolio, TradeLog
 from scheduler import _make_prune_job

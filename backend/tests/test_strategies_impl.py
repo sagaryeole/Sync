@@ -42,14 +42,16 @@ def _ctx(candles, position=None, cash=100000.0, equity=100000.0, params=None):
 class TestSMACrossover:
     def test_holds_without_warmup(self):
         strat = SMACrossoverStrategy()
-        prices = [100.0 + i for i in range(10)]  # < 21 bars
+        prices = [100.0 + i for i in range(10)]  # < 22 bars (slow_win + 1)
         candles = _candles(prices)
         d = strat.evaluate(_ctx(candles))
         assert d.action == Action.HOLD
 
     def test_golden_cross_buys(self):
         strat = SMACrossoverStrategy()
-        prices = [100.0] * 20 + [110.0] * 5  # sharp rise → fast > slow
+        # 21 flat bars (fast == slow) then one sharp jump: fast crosses above
+        # slow on exactly the last bar — a true cross, not just fast > slow.
+        prices = [100.0] * 21 + [130.0]
         candles = _candles(prices)
         d = strat.evaluate(_ctx(candles))
         assert d.action == Action.BUY
@@ -57,7 +59,7 @@ class TestSMACrossover:
 
     def test_death_cross_sells(self):
         strat = SMACrossoverStrategy()
-        prices = [110.0] * 20 + [100.0] * 5  # decline → fast < slow
+        prices = [110.0] * 21 + [80.0]
         candles = _candles(prices)
         pos = Position(symbol="BTC", quantity=1.0, avg_entry_price=110.0)
         d = strat.evaluate(_ctx(candles, position=pos))

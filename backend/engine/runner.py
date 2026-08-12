@@ -10,12 +10,15 @@ candle history and strategy config are handed in via injected callables, kept
 DB-agnostic and unit-testable in isolation.
 """
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 from engine.core import PaperEngine
+from engine.logging import set_correlation_id
 from engine.market_state import MarketState
-from strategies.base import Action, Decision, Position as StrategyPosition, StrategyContext
+from strategies.base import (
+    Action, Decision, Position as StrategyPosition, StrategyContext,
+)
 from strategies.registry import get_strategy
 
 logger = logging.getLogger("engine.runner")
@@ -37,7 +40,7 @@ class RunResult:
     symbol: str
     decision: Decision
     last_price: float = 0.0
-    fill: object = None                    # engine.paper_broker.Fill, if the decision traded
+    fill: object = None  # engine.paper_broker.Fill, if traded
     reject_reason: Optional[str] = None
 
 
@@ -54,40 +57,56 @@ class StrategyRunner:
         market: MarketState,
         candle_provider: Callable[[str, int], list],
         symbols: List[str],
+        symbol_filter: Optional[Callable[[str], bool]] = None,
     ):
         self.engine = engine
         self.market = market
         self.candle_provider = candle_provider
         self.symbols = symbols
+        self.symbol_filter = symbol_filter
 
-    def run_all(self, strategy_configs: List[RunnerStrategyConfig]) -> List[RunResult]:
+    def run_all(self, configs: List[RunnerStrategyConfig]) -> List[RunResult]:
         """Evaluate every (strategy, symbol) pair once.
 
-        Returns one RunResult per pair that had enough warmup data to evaluate
-        (pairs skipped for insufficient history are omitted, not HOLD).
+        Returns one RunResult per pair that had enough warmup data to
+        evaluate (pairs skipped for insufficient history are omitted).
         """
         results: List[RunResult] = []
-        for cfg in strategy_configs:
+        for cfg in configs:
             strategy = get_strategy(cfg.key)
             if strategy is None:
-                logger.warning("Strategy key %s not found in registry, skipping", cfg.key)
+                logger.warning(
+                    "Strategy key %s not found in registry, skipping",
+                    cfg.key,
+                )
                 continue
             account = self.engine.get_account(cfg.strategy_id)
             if account is None:
-                logger.warning("Strategy id %d not registered with engine, skipping", cfg.strategy_id)
+                logger.warning(
+                    "Strategy id %d not registered with engine, skipping",
+                    cfg.strategy_id,
+                )
                 continue
             if account.is_halted:
                 continue
 
             marks = self.market.snapshot()
-            for symbol in self.symbols:
+            symbols = [
+                s for s in self.symbols
+                if self.symbol_filter is None or self.symbol_filter(s)
+            ]
+            for symbol in symbols:
                 result = self._run_one(strategy, cfg, account, symbol, marks)
                 if result is not None:
                     results.append(result)
         return results
 
-    def _run_one(self, strategy, cfg: RunnerStrategyConfig, account, symbol: str, marks: Dict[str, float]) -> Optional[RunResult]:
-        candles = self.candle_provider(symbol, max(strategy.warmup_bars + 5, 30))
+    def _run_one(self, strategy, cfg: RunnerStrategyConfig,
+                 account, symbol: str,
+                 marks: Dict[str, float]) -> Optional[RunResult]:
+        candles = self.candle_provider(
+            symbol, max(strategy.warmup_bars + 5, 30),
+        )
         if len(candles) < strategy.warmup_bars:
             return None
 
@@ -118,41 +137,48 @@ class StrategyRunner:
         try:
             decision = strategy.evaluate(ctx)
         except Exception:
-            logger.exception("Strategy %s raised while evaluating %s", cfg.key, symbol)
+            logger.exception(
+                "Strategy %s raised while evaluating %s",
+                cfg.key, symbol,
+            )
             return None
 
         fill = None
         reject_reason = None
 
-        if decision.action == Action.BUY:
-            # Opening/adding — size through the risk manager (2% risk, capped, SL/TP attached).
-            fill, reject_reason = self.engine.submit_order(
-                strategy_id=cfg.strategy_id,
-                symbol=symbol,
-                side=Action.BUY,
-                order_type="MARKET",
-                quantity=None,
-                attach_stops=True,
-            )
-        elif decision.action == Action.SELL:
-            # Exiting — always flat the full position. Auto-sizing (risk % of
-            # equity against a fresh stop distance) does not mean "close the
-            # position I already hold", so it is never used here. Long-only:
-            # a SELL signal with no open position is a no-op, not a short.
-            if strategy_position is not None and strategy_position.quantity > 0:
+        dry_run = bool((cfg.params or {}).get("dry_run", False))
+
+        with set_correlation_id():
+            if dry_run:
+                pass  # shadow mode: evaluate, but never submit
+            elif decision.action == Action.BUY:
                 fill, reject_reason = self.engine.submit_order(
                     strategy_id=cfg.strategy_id,
                     symbol=symbol,
-                    side=Action.SELL,
+                    side=Action.BUY,
                     order_type="MARKET",
-                    quantity=strategy_position.quantity,
-                    attach_stops=False,
+                    quantity=None,
+                    attach_stops=True,
                 )
-            else:
-                reject_reason = "NO_POSITION_TO_SELL"
+            elif decision.action == Action.SELL:
+                if strategy_position is not None \
+                        and strategy_position.quantity > 0:
+                    fill, reject_reason = self.engine.submit_order(
+                        strategy_id=cfg.strategy_id,
+                        symbol=symbol,
+                        side=Action.SELL,
+                        order_type="MARKET",
+                        quantity=strategy_position.quantity,
+                        attach_stops=False,
+                    )
+                else:
+                    reject_reason = "NO_POSITION_TO_SELL"
 
         if reject_reason:
-            logger.info("Strategy %s %s %s rejected: %s", cfg.key, decision.action, symbol, reject_reason)
+            logger.info(
+                "Strategy %s %s %s rejected: %s",
+                cfg.key, decision.action, symbol, reject_reason,
+            )
 
         return RunResult(
             strategy_id=cfg.strategy_id,

@@ -125,6 +125,7 @@ class TestMarketOrder:
         # First buy to have a position
         buy_order = make_order(side=OrderSide.BUY, qty=1.0)
         broker.execute_market(buy_order, acct)
+        avg_entry = acct.get_position("BTC").avg_entry_price
         # Now sell
         sell_order = make_order(side=OrderSide.SELL, qty=1.0)
         fill = broker.execute_market(sell_order, acct)
@@ -132,6 +133,9 @@ class TestMarketOrder:
         assert fill.side == "SELL"
         # fill_price = mid - spread/2 - slip = 50000 - 5 - 15 = 49980
         assert fill.price == pytest.approx(49980.0, rel=0.01)
+        # realized_pnl = qty*(sell_price - avg_entry) - fee
+        expected_realized = 1.0 * (fill.price - avg_entry) - fill.fee
+        assert fill.realized_pnl == pytest.approx(expected_realized, rel=0.01)
 
     def test_market_buy_insufficient_cash(self):
         tick = make_tick(50000, bid=49999, ask=50001)

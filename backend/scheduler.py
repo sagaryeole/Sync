@@ -26,6 +26,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from database import get_session
+from engine.logging import set_correlation_id
 from engine.core import PaperEngine
 from engine.market_state import MarketState
 from engine.runner import RunnerStrategyConfig, StrategyRunner
@@ -41,6 +42,7 @@ from models import (
     Strategy as StrategyModel,
 )
 from strategies.base import Action, Candle as StrategyCandle
+from strategies.schemas import validate_params
 from settings import get_settings
 
 logger = logging.getLogger("scheduler")
@@ -89,7 +91,9 @@ def _strategy_configs() -> list:
             params = {}
             if r.params_json:
                 try:
-                    params = json.loads(r.params_json)
+                    raw = json.loads(r.params_json)
+                    if isinstance(raw, dict):
+                        params = validate_params(r.key, raw)
                 except (TypeError, ValueError):
                     params = {}
             configs.append(RunnerStrategyConfig(strategy_id=r.id, key=r.key, params=params))
@@ -103,6 +107,12 @@ def _strategy_configs() -> list:
 # ---------------------------------------------------------------------------
 
 def _persist_fills(session, fills) -> None:
+    """Persist Order + Fill rows for a batch of engine fills, one transaction (H5).
+
+    ``f.realized_pnl`` comes from the broker (computed against the pre-fill
+    avg entry price before ``apply_fill`` mutates it) — 0.0 for every BUY,
+    the realized amount for a SELL.
+    """
     for f in fills:
         liquidity = "MAKER" if f.order_type == "LIMIT" else "TAKER"
         order_row = OrderModel(
@@ -128,7 +138,7 @@ def _persist_fills(session, fills) -> None:
             quantity=f.quantity,
             price=f.price,
             fee=f.fee,
-            realized_pnl=0.0,  # authoritative realized P&L lives on portfolios.realized_pnl
+            realized_pnl=f.realized_pnl,
             mark_price=f.price,
             liquidity=liquidity,
             ts=f.ts,
@@ -234,86 +244,93 @@ def _flush_engine_state(engine: PaperEngine) -> None:
 
 def _make_engine_tick_job(engine: PaperEngine):
     def job():
-        try:
-            engine.on_tick_batch()
-            _flush_engine_state(engine)
-        except Exception:
-            logger.exception("engine_tick job failed")
+        with set_correlation_id():
+            try:
+                engine.on_tick_batch()
+                _flush_engine_state(engine)
+            except Exception:
+                logger.exception("engine_tick job failed")
     return job
 
 
-def _make_strategy_tick_job(engine: PaperEngine, market: MarketState, symbols):
-    runner = StrategyRunner(engine, market, _candle_provider, symbols)
+def _make_strategy_tick_job(engine: PaperEngine, market: MarketState, symbols, feed_manager):
+    runner = StrategyRunner(
+        engine, market, _candle_provider, symbols,
+        symbol_filter=feed_manager.is_symbol_tradable,
+    )
 
     def job():
-        try:
-            configs = _strategy_configs()
-            if not configs:
-                return
-            results = runner.run_all(configs)
-            if results:
-                session = get_session()
-                try:
-                    _persist_signals(session, results)
-                    session.commit()
-                except Exception:
-                    session.rollback()
-                    logger.exception("Failed to persist signals")
-                finally:
-                    session.close()
-            _flush_engine_state(engine)
-        except Exception:
-            logger.exception("strategy_tick job failed")
+        with set_correlation_id():
+            try:
+                configs = _strategy_configs()
+                if not configs:
+                    return
+                results = runner.run_all(configs)
+                if results:
+                    session = get_session()
+                    try:
+                        _persist_signals(session, results)
+                        session.commit()
+                    except Exception:
+                        session.rollback()
+                        logger.exception("Failed to persist signals")
+                    finally:
+                        session.close()
+                _flush_engine_state(engine)
+            except Exception:
+                logger.exception("strategy_tick job failed")
     return job
 
 
 def _make_equity_snapshot_job(engine: PaperEngine, market: MarketState):
     def job():
-        session = get_session()
-        try:
-            marks = market.snapshot()
-            now = datetime.now(timezone.utc)
-            for strategy_id, account in engine.get_all_accounts().items():
-                session.add(EquitySnapshot(
-                    strategy_id=strategy_id,
-                    ts=now,
-                    equity=account.equity(marks),
-                    cash=account.cash,
-                    position_value=account.position_value(marks),
-                    realized_pnl=account.realized_pnl,
-                    unrealized_pnl=account.unrealized_pnl(marks),
-                    drawdown_pct=account.drawdown_pct(marks),
-                ))
-            session.commit()
-        except Exception:
-            session.rollback()
-            logger.exception("equity_snapshot job failed")
-        finally:
-            session.close()
+        with set_correlation_id():
+            session = get_session()
+            try:
+                marks = market.snapshot()
+                now = datetime.now(timezone.utc)
+                for strategy_id, account in engine.get_all_accounts().items():
+                    session.add(EquitySnapshot(
+                        strategy_id=strategy_id,
+                        ts=now,
+                        equity=account.equity(marks),
+                        cash=account.cash,
+                        position_value=account.position_value(marks),
+                        realized_pnl=account.realized_pnl,
+                        unrealized_pnl=account.unrealized_pnl(marks),
+                        drawdown_pct=account.drawdown_pct(marks),
+                    ))
+                session.commit()
+            except Exception:
+                session.rollback()
+                logger.exception("equity_snapshot job failed")
+            finally:
+                session.close()
     return job
 
 
 def _make_prune_job():
     def job():
-        settings = get_settings()
-        session = get_session()
-        try:
-            now = datetime.now(timezone.utc)
-            price_cutoff = now - timedelta(hours=24)
-            session.query(PriceTicker).filter(PriceTicker.timestamp < price_cutoff).delete()
+        with set_correlation_id():
+            settings = get_settings()
+            session = get_session()
+            try:
+                now = datetime.now(timezone.utc)
+                price_cutoff = now - timedelta(hours=24)
+                session.query(PriceTicker).filter(PriceTicker.timestamp < price_cutoff).delete()
 
-            candle_cutoff = now - timedelta(days=settings.candle_retention_days)
-            session.query(Candle).filter(Candle.open_time < candle_cutoff).delete()
+                candle_cutoff = now - timedelta(days=settings.candle_retention_days)
+                session.query(Candle).filter(Candle.open_time < candle_cutoff).delete()
 
-            equity_cutoff = now - timedelta(hours=settings.equity_retention_hours)
-            session.query(EquitySnapshot).filter(EquitySnapshot.ts < equity_cutoff).delete()
+                equity_cutoff = now - timedelta(hours=settings.equity_retention_hours)
+                session.query(EquitySnapshot).filter(EquitySnapshot.ts < equity_cutoff).delete()
 
-            session.commit()
-        except Exception:
-            session.rollback()
-            logger.exception("prune job failed")
-        finally:
-            session.close()
+                session.commit()
+            except Exception:
+                session.rollback()
+                logger.exception("prune job failed")
+            finally:
+                session.close()
     return job
 
 
@@ -321,7 +338,7 @@ def _make_prune_job():
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def start_scheduler(engine: PaperEngine, market: MarketState, symbols) -> BackgroundScheduler:
+def start_scheduler(engine: PaperEngine, market: MarketState, symbols, feed_manager) -> BackgroundScheduler:
     """Build and start the engine's background job scheduler."""
     settings = get_settings()
     scheduler = BackgroundScheduler()
@@ -337,7 +354,7 @@ def start_scheduler(engine: PaperEngine, market: MarketState, symbols) -> Backgr
         replace_existing=True,
     )
     scheduler.add_job(
-        _make_strategy_tick_job(engine, market, symbols),
+        _make_strategy_tick_job(engine, market, symbols, feed_manager),
         "interval",
         seconds=settings.strategy_interval_seconds,
         id="strategy_tick",

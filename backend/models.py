@@ -206,3 +206,14 @@ class TradeLog(Base):
     quantity = Column(Numeric(20, 8, asdecimal=False), nullable=False)
     price = Column(Numeric(20, 8, asdecimal=False), nullable=False)
     timestamp = Column(DateTime, nullable=False, default=lambda: datetime.datetime.now(timezone.utc))
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(UtcDateTime, nullable=False, default=lambda: datetime.datetime.now(timezone.utc), index=True)
+    actor = Column(String(100), nullable=False)
+    action = Column(String(100), nullable=False)
+    target = Column(String(100), nullable=False)
+    before = Column(Text)
+    after = Column(Text)

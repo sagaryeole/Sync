@@ -39,6 +39,11 @@ class FeedManager:
         if settings.feed_record_path:
             self.recorder = FeedRecorder(settings.feed_record_path)
             self.recorder.open()
+
+        # V3: per-symbol circuit breaker
+        self._symbol_fail_counts: Dict[str, int] = {}
+        self._symbol_circuit_open: Dict[str, bool] = {}
+        self._circuit_threshold = 5
         
         # Callbacks
         self.on_tick_cb: Optional[Callable[[Tick], None]] = None
@@ -72,6 +77,23 @@ class FeedManager:
             "reconnects": self.reconnect_count,
             "rejected_ticks": self.rejected_count
         }
+
+    def is_symbol_tradable(self, symbol: str) -> bool:
+        """Check if a symbol's circuit breaker is closed (tradable)."""
+        return not self._symbol_circuit_open.get(symbol, False)
+
+    def get_tradable_symbols(self, symbols: List[str]) -> List[str]:
+        """Filter symbols to only those with closed circuit breakers."""
+        return [s for s in symbols if self.is_symbol_tradable(s)]
+
+    def open_circuit(self, symbol: str) -> None:
+        """Manually open the circuit for a symbol (e.g., external halt)."""
+        self._symbol_circuit_open[symbol] = True
+
+    def close_circuit(self, symbol: str) -> None:
+        """Manually close the circuit for a symbol."""
+        self._symbol_circuit_open[symbol] = False
+        self._symbol_fail_counts[symbol] = 0
 
     async def start(
         self,
@@ -121,8 +143,23 @@ class FeedManager:
                         )
                     except TickValidationError as e:
                         self.rejected_count += 1
+                        self._symbol_fail_counts[tick.symbol] = \
+                            self._symbol_fail_counts.get(tick.symbol, 0) + 1
+                        if self._symbol_fail_counts[tick.symbol] >= self._circuit_threshold:
+                            self._symbol_circuit_open[tick.symbol] = True
+                            logger.warning(
+                                "Circuit breaker OPEN for %s after %d consecutive failures",
+                                tick.symbol, self._symbol_fail_counts[tick.symbol],
+                            )
                         logger.warning("Tick rejected: %s", e)
                         continue
+
+                    # Reset fail count on successful tick; close circuit if open
+                    if tick.symbol in self._symbol_fail_counts:
+                        self._symbol_fail_counts[tick.symbol] = 0
+                        if self._symbol_circuit_open.get(tick.symbol):
+                            self._symbol_circuit_open[tick.symbol] = False
+                            logger.info("Circuit breaker CLOSED for %s", tick.symbol)
                     
                     self.last_tick_time = datetime.now(timezone.utc)
                     self.last_accepted_prices[tick.symbol] = tick.price

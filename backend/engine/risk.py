@@ -38,6 +38,7 @@ class RiskConfig:
     min_notional: float = 10.0           # minimum order size in USD
     trailing_stop: bool = False          # optional trailing stop
     trailing_stop_pct: float = 0.02      # trail by 2%
+    halt_manual_portfolio: bool = False  # H18: kill-switch also halts manual portfolio
 
 
 @dataclass

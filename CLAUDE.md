@@ -38,10 +38,16 @@ npm run lint
 - `config.py` – Backward-compat shim exporting `settings` values
 - `database.py` – SQLAlchemy engine, `SessionLocal`, `get_session()`, `init_db()`, `close_db()`
 - `models.py` – ORM: `Asset`, `PriceTicker`, `Portfolio`, `TradeLog`, `Candle`, `Strategy`, `PortfolioAccount`, `Position`, `Fill`, `Order`, `Signal`, `EquitySnapshot`
-- `bot.py` – Legacy compatibility shim (`run_bot_cycle`, `get_signal`, `start_bot`, `execute_trade`, `prune_old_prices`); actual trading logic lives in `engine/`
+- `scheduler.py` – Engine background jobs: `engine_tick` (1s), `strategy_tick` (15s), `equity_snapshot` (30s), `prune` (1h). Replaces the deleted `bot.py`'s single MA-crossover cycle.
 - `feeds/` – Market data ingestion (Coinbase, Binance, synthetic, recorder, backfill, validation, manager)
-- `engine/` – Paper trading engine (`core.py`), broker (`paper_broker.py`), risk (`risk.py`), portfolio (`portfolio.py`), metrics (`metrics.py`), market state (`market_state.py`)
-- `strategies/` – Trading strategies
+- `engine/` – Paper trading engine (`core.py`), broker (`paper_broker.py`), risk (`risk.py`), portfolio (`portfolio.py`), metrics (`metrics.py`), market state (`market_state.py`), strategy runner (`runner.py`)
+- `strategies/` – `sma_crossover`, `rsi_reversion`, `momentum_breakout`, plus `indicators.py`, `base.py`, `registry.py`
+
+  > `bot.py` is gone (Phase 2, step 37). Its two live call sites were carried over rather than
+  > dropped: the legacy weighted-average cost-basis math moved verbatim into
+  > `main.py:_legacy_execute_trade` (still backs `POST /trade` until the Phase-1 REST shims are
+  > deleted in Phase 3 step 46); `/bot/signals` now reads the latest non-HOLD row per symbol from
+  > the `signals` table instead of running the old MA crossover inline.
 
 **Startup sequence (lifespan):**
 1. `init_db()` — create tables
@@ -203,4 +209,6 @@ npm run build
 
 - **WebSocket:** `docs/WS_PROTOCOL.md` is planned (step 41); no WS endpoint exists yet
 - **Frontend tests:** No Jest/Vitest configured yet; `store/selectors`, `api/ws`, `Watchlist`, `OrderTicket`, `ErrorBoundary` need coverage
-- **Legacy bot:** `bot.py` is a compatibility shim; the engine in `engine/core.py` is the production path
+- **H5 (crash recovery):** account state is warm-started from the last persisted `portfolios`/`positions`
+  snapshot on startup, not replayed deterministically from the `fills` log — a crash between a fill
+  and its DB commit can still diverge. See `TODO.md` H5.

@@ -343,6 +343,50 @@ class TestKillSwitch:
         engine = make_engine()
         assert engine.resume_strategy(999) is False
 
+    def test_manual_portfolio_skipped_by_default(self):
+        tick = make_tick(50000, bid=49999, ask=50001)
+        ms = make_market_state(tick=tick, prices={"BTC": 50000.0})
+        broker = PaperBroker(ms, slippage_bps=0, impact_notional=1e12)
+        rm = RiskManager(RiskConfig(max_drawdown_pct=0.10, max_position_pct=1.0))
+        engine = PaperEngine(ms, broker, rm, EngineConfig(starting_cash=100000.0))
+        engine.register_strategy(1, "manual", 100000.0)
+
+        engine.submit_order(1, "BTC", "BUY", "MARKET", quantity=1.0)
+        account = engine.get_account(1)
+        account.peak_equity = 100000.0
+
+        new_tick = make_tick(40000, bid=39999, ask=40001)
+        ms.last_tick.return_value = new_tick
+        ms.snapshot.return_value = {"BTC": 40000.0}
+
+        engine.on_tick_batch()
+
+        assert not account.is_halted
+
+    def test_manual_portfolio_halted_when_enabled(self):
+        tick = make_tick(50000, bid=49999, ask=50001)
+        ms = make_market_state(tick=tick, prices={"BTC": 50000.0})
+        broker = PaperBroker(ms, slippage_bps=0, impact_notional=1e12)
+        rm = RiskManager(RiskConfig(
+            max_drawdown_pct=0.10, max_position_pct=1.0,
+            halt_manual_portfolio=True,
+        ))
+        engine = PaperEngine(ms, broker, rm, EngineConfig(starting_cash=100000.0))
+        engine.register_strategy(1, "manual", 100000.0)
+
+        engine.submit_order(1, "BTC", "BUY", "MARKET", quantity=1.0)
+        account = engine.get_account(1)
+        account.peak_equity = 100000.0
+
+        new_tick = make_tick(40000, bid=39999, ask=40001)
+        ms.last_tick.return_value = new_tick
+        ms.snapshot.return_value = {"BTC": 40000.0}
+
+        engine.on_tick_batch()
+
+        assert account.is_halted
+        assert account.halt_reason == "MAX_DRAWDOWN"
+
 
 class TestFillManagement:
     def test_drain_pending_fills(self):

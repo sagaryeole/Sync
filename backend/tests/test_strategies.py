@@ -89,8 +89,16 @@ class TestStrategyProtocol:
 
 class TestRegistry:
     def setup_method(self):
-        # Isolate registry state between tests
+        # Isolate registry state between tests — restore afterward so this
+        # doesn't leak into other test modules' view of the global STRATEGIES
+        # dict (e.g. the real sma_crossover/rsi_reversion/momentum_breakout
+        # registered at import time).
+        self._saved_strategies = dict(STRATEGIES)
         STRATEGIES.clear()
+
+    def teardown_method(self):
+        STRATEGIES.clear()
+        STRATEGIES.update(self._saved_strategies)
 
     def test_register_adds_strategy(self):
         register(DummyStrategy())

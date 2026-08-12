@@ -17,6 +17,7 @@ import logging
 import math
 import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -39,6 +40,7 @@ logger = logging.getLogger("engine.core")
 _EPS = 1e-9
 _MAX_CLIENT_ORDER_ID_LEN = 50
 _MAX_WORKING_ORDERS = 1000
+_MAX_SEEN_ORDER_IDS = 10000
 
 
 @dataclass
@@ -82,6 +84,9 @@ class PaperEngine:
 
         # client_order_id -> Order (working orders only)
         self._working_orders: Dict[str, Order] = {}
+
+        # H14: bounded dedupe set for all seen client_order_ids
+        self._seen_order_ids: OrderedDict[str, None] = OrderedDict()
 
         # List of fills produced since last flush (for DB persistence)
         self._pending_fills: List[Fill] = []
@@ -157,7 +162,15 @@ class PaperEngine:
                     return None, RejectReason.CLIENT_ORDER_ID_INVALID.value
 
             # H14: bound the dedupe set
+            if client_order_id in self._seen_order_ids:
+                return None, "DUPLICATE_CLIENT_ORDER_ID"
+            self._seen_order_ids[client_order_id] = None
+            if len(self._seen_order_ids) > _MAX_SEEN_ORDER_IDS:
+                self._seen_order_ids.popitem(last=False)
+
+            # H14: bound working orders
             if len(self._working_orders) >= _MAX_WORKING_ORDERS:
+                self._seen_order_ids.popitem(last=False)
                 return None, RejectReason.TOO_MANY_WORKING_ORDERS.value
 
             # Parse side and type
@@ -391,6 +404,9 @@ class PaperEngine:
         for strategy_id, account in self._accounts.items():
             if account.is_halted:
                 continue
+            # H18: optionally skip the manual portfolio
+            if not self.risk.config.halt_manual_portfolio and account.strategy_key == "manual":
+                continue
             if self.risk.check_drawdown(account, marks):
                 self._halt_strategy(account, marks)
 
@@ -440,6 +456,55 @@ class PaperEngine:
         with self._lock:
             marks = self.market.snapshot()
             return {sid: acct.equity(marks) for sid, acct in self._accounts.items()}
+
+    def rebuild_from_fills(
+        self,
+        fills_by_strategy: Dict[int, List[Fill]],
+        marks: Dict[str, float],
+        before_ts: Optional[datetime] = None,
+    ) -> Dict[int, Dict]:
+        """H5/V1: deterministic replay of fills to rebuild account state.
+
+        Args:
+            fills_by_strategy: {strategy_id: [Fill, ...]} from DB, oldest-first
+            marks: current market prices for unrealized P&L
+            before_ts: if provided, only replay fills with ts < before_ts
+
+        Returns:
+            {strategy_id: {"cash": float, "positions": {symbol: qty}, "diverged": bool}}
+        """
+        rebuilt = {}
+        with self._lock:
+            for strategy_id, account in self._accounts.items():
+                cash = float(account.starting_cash)
+                positions: Dict[str, float] = {}
+                realized_pnl = 0.0
+                fees = 0.0
+
+                for f in fills_by_strategy.get(strategy_id, []):
+                    if before_ts is not None and f.ts >= before_ts:
+                        break
+                    fees += float(f.fee)
+                    if f.side == "BUY":
+                        cash -= float(f.quantity) * float(f.price) + float(f.fee)
+                        positions[f.symbol] = positions.get(f.symbol, 0.0) + float(f.quantity)
+                    else:
+                        qty = float(f.quantity)
+                        cash += qty * float(f.price) - float(f.fee)
+                        positions[f.symbol] = positions.get(f.symbol, 0.0) - qty
+
+                # Round positions to 0 if tiny
+                for sym in list(positions.keys()):
+                    if abs(positions[sym]) < 1e-9:
+                        del positions[sym]
+
+                rebuilt[strategy_id] = {
+                    "cash": cash,
+                    "positions": positions,
+                    "realized_pnl": realized_pnl,
+                    "fees": fees,
+                }
+        return rebuilt
 
     def resume_strategy(self, strategy_id: int) -> bool:
         """Resume a halted strategy."""

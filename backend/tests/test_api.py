@@ -24,15 +24,16 @@ def test_list_assets():
 
 
 def test_get_asset():
-    r = client.get("/assets/BTC")
+    symbol = config.ASSETS[0]["symbol"]
+    r = client.get(f"/assets/{symbol}")
     assert r.status_code == 200
     data = r.json()
-    assert data["symbol"] == "BTC"
-    assert data["name"] == "Bitcoin"
+    assert data["symbol"] == symbol
+    assert data["name"] == config.ASSETS[0]["name"]
 
 
 def test_get_asset_not_found():
-    r = client.get("/assets/XZY")
+    r = client.get("/assets/ZZZZZZ")
     assert r.status_code == 404
 
 
@@ -47,10 +48,11 @@ def test_list_prices():
 
 
 def test_list_prices_filtered():
-    r = client.get("/prices?asset=BTC")
+    symbol = config.ASSETS[0]["symbol"]
+    r = client.get(f"/prices?asset={symbol}")
     assert r.status_code == 200
     data = r.json()
-    assert all(p["symbol"] == "BTC" for p in data)
+    assert all(p["symbol"] == symbol for p in data)
 
 
 def test_list_prices_filtered_time():
@@ -61,34 +63,36 @@ def test_list_prices_filtered_time():
 
 
 def test_get_portfolio():
-    r = client.get("/portfolio/BTC")
-    # conftest creates portfolio entries for all assets, so BTC exists.
+    symbol = config.ASSETS[0]["symbol"]
+    r = client.get(f"/portfolio/{symbol}")
+    # conftest creates portfolio entries for all assets, so the first asset exists.
     assert r.status_code == 200
     data = r.json()
-    assert data["symbol"] == "BTC"
+    assert data["symbol"] == symbol
 
 
 def test_get_portfolio_not_found():
-    r = client.get("/portfolio/XYZ")
-    # XYZ matches the ^[A-Z]{3}$ regex, so it passes validation but no
+    r = client.get("/portfolio/ZZZZZZ")
+    # ZZZZZZ matches the ^[A-Z]{2,10}$ regex, so it passes validation but no
     # portfolio entry exists -> 404.
     assert r.status_code == 404
 
 
 def test_execute_trade_success():
     import random
+    symbol = config.ASSETS[0]["symbol"]
     # Create a condition to trigger BUY signal
     session = get_session()
 
     # Add history
     for i in range(10):
         price = 10000 + i * 500 + random.uniform(-100, 100)
-        session.add(PriceTicker(symbol="BTC", price=price, timestamp=datetime.now(timezone.utc)))
+        session.add(PriceTicker(symbol=symbol, price=price, timestamp=datetime.now(timezone.utc)))
     session.commit()
 
-    # Set BTC price low
-    session.query(PriceTicker).filter_by(symbol="BTC").delete()
-    session.add(PriceTicker(symbol="BTC", price=5000, timestamp=datetime.now(timezone.utc)))
+    # Set price low
+    session.query(PriceTicker).filter_by(symbol=symbol).delete()
+    session.add(PriceTicker(symbol=symbol, price=5000, timestamp=datetime.now(timezone.utc)))
     session.commit()
 
     # Ensure USD balance
@@ -101,22 +105,24 @@ def test_execute_trade_success():
     session.commit()
     session.close()
 
-    r = client.post("/trade", json={"type": "BUY", "symbol": "BTC", "quantity": 1})
+    r = client.post("/trade", json={"type": "BUY", "symbol": symbol, "quantity": 1})
     assert r.status_code == 201
 
 
 def test_execute_trade_insufficient_balance():
-    r = client.post("/trade", json={"type": "BUY", "symbol": "BTC", "quantity": 1000000})
+    symbol = config.ASSETS[0]["symbol"]
+    r = client.post("/trade", json={"type": "BUY", "symbol": symbol, "quantity": 1000000})
     assert r.status_code == 400
 
 
 def test_execute_trade_invalid_symbol():
-    r = client.post("/trade", json={"type": "BUY", "symbol": "XYZ", "quantity": 1})
-    assert r.status_code == 404
+    r = client.post("/trade", json={"type": "BUY", "symbol": "ZZZZZZ", "quantity": 1})
+    assert r.status_code == 422
 
 
 def test_execute_trade_invalid_type():
-    r = client.post("/trade", json={"type": "INVALID", "symbol": "BTC", "quantity": 1})
+    symbol = config.ASSETS[0]["symbol"]
+    r = client.post("/trade", json={"type": "INVALID", "symbol": symbol, "quantity": 1})
     # Pydantic rejects the invalid type via the Field pattern -> 422 Unprocessable Entity
     assert r.status_code == 422
 
@@ -130,11 +136,12 @@ def test_get_bot_signals():
 
 def test_list_trades_limit_capped():
     """H8: limit query param must be capped at 1000 server-side."""
+    symbol = config.ASSETS[0]["symbol"]
     session = get_session()
     for i in range(1500):
         session.add(TradeLog(
             type="BUY",
-            symbol="BTC",
+            symbol=symbol,
             quantity=0.01,
             price=50000.0 + i,
             timestamp=datetime.now(timezone.utc)

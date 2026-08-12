@@ -98,6 +98,7 @@ class Fill:
     order_type: str     # "MARKET", "LIMIT", "STOP"
     ts: datetime
     reject_reason: Optional[str] = None
+    realized_pnl: float = 0.0  # 0.0 for BUY; qty*(price-avg_entry_before)-fee for SELL
 
 
 @dataclass
@@ -268,6 +269,15 @@ class PaperBroker:
                 order.reject_reason = RejectReason.INSUFFICIENT_POSITION
                 return None
 
+        # Capture the pre-fill avg entry price for SELL realized P&L — apply_fill
+        # mutates (and on full exit, resets) it.
+        realized_pnl = 0.0
+        if order.side == OrderSide.SELL:
+            pos_before = account.get_position(order.symbol)
+            if pos_before is not None:
+                qty_to_sell = min(pos_before.quantity, order.quantity)
+                realized_pnl = qty_to_sell * (fill_price - pos_before.avg_entry_price) - fee
+
         # Apply the fill
         now = datetime.now(timezone.utc)
         try:
@@ -301,6 +311,7 @@ class PaperBroker:
             fee=fee,
             order_type=order.order_type.value,
             ts=now,
+            realized_pnl=realized_pnl,
         )
 
     def check_limit_fill(
@@ -360,6 +371,13 @@ class PaperBroker:
                 order.reject_reason = RejectReason.INSUFFICIENT_POSITION
                 return None
 
+        realized_pnl = 0.0
+        if order.side == OrderSide.SELL:
+            pos_before = account.get_position(order.symbol)
+            if pos_before is not None:
+                qty_to_sell = min(pos_before.quantity, order.quantity)
+                realized_pnl = qty_to_sell * (fill_price - pos_before.avg_entry_price) - fee
+
         now = datetime.now(timezone.utc)
         try:
             account.apply_fill(
@@ -392,6 +410,7 @@ class PaperBroker:
             fee=fee,
             order_type=order.order_type.value,
             ts=now,
+            realized_pnl=realized_pnl,
         )
 
     def check_stop_trigger(

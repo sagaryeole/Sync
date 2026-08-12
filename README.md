@@ -4,7 +4,7 @@ A lightweight paper-trading terminal being rebuilt from a mock-data demo into a 
 
 > **Disclaimer:** This is a paper-trading simulator for educational purposes only. It uses real market data but virtual cash. Nothing here is financial advice, and no real money is ever at risk.
 
-> **Status:** mid-rewrite, tracked in [`TODO.md`](TODO.md). Phase 0 (safety net/tooling) and Phase 1 (live feeds — Coinbase/Binance WebSocket with automatic failover to synthetic data) are complete and gate-verified. Phase 2's paper-trading engine (`backend/engine/`, `backend/strategies/`) is written but not yet wired into the running app — the live API still trades through the legacy moving-average bot in `backend/bot.py`. There is no WebSocket API for clients yet (planned for Phase 3); the frontend polls REST.
+> **Status:** mid-rewrite, tracked in [`TODO.md`](TODO.md). Phase 0 (safety net/tooling), Phase 1 (live feeds — Coinbase/Binance WebSocket with automatic failover to synthetic data), and Phase 2 (multi-strategy paper-trading engine) are complete and gate-verified. Four strategies (`manual`, `sma_crossover`, `rsi_reversion`, `momentum_breakout`) each trade their own paper portfolio against live prices with real fees, slippage, SL/TP, position sizing, and a max-drawdown kill-switch. There is no WebSocket API for clients yet (planned for Phase 3); the frontend still polls the legacy REST shims, which now sit in front of the new engine rather than the old single-bot.
 
 ## Quick Start
 
@@ -54,8 +54,9 @@ python3 -m pytest -q
 - **Backend** – FastAPI (Python) exposes REST endpoints and ingests a live WebSocket price feed (Coinbase primary, Binance secondary, synthetic fallback) into an in-memory market state, backed by a SQLite database.
 - **Frontend** – React (Vite + TypeScript) consumes the REST API via polling and displays live prices, portfolio, and trade history.
 - **Data persistence** – SQLite via SQLAlchemy; data survives restarts.
-- **Bot logic (current)** – A single moving-average crossover bot (`backend/bot.py`) trades on a fixed interval via APScheduler; this is a legacy shim slated for removal once the engine below is wired in.
-- **Bot logic (built, not yet wired in)** – `backend/engine/` (paper broker, risk manager, portfolio accounting) and `backend/strategies/` (SMA crossover, RSI reversion, momentum breakout, plus indicators) implement a multi-strategy paper-trading engine with SL/TP, position sizing, and a max-drawdown kill-switch. Not yet connected to the scheduler or REST API — see `TODO.md` Phase 2.
+- **Paper-trading engine** – `backend/engine/` (`PaperEngine`, `PaperBroker`, `RiskManager`, `PortfolioAccount`) runs one portfolio per strategy: MARKET/LIMIT/STOP order types, realistic fees + slippage, SL/TP, position sizing (risk 2% of equity per trade, capped at 20%), and a max-drawdown kill-switch (halts + flattens at 25% drawdown from peak).
+- **Strategies** – `backend/strategies/` implements `sma_crossover`, `rsi_reversion`, and `momentum_breakout` (plus a `manual` strategy = your own trades), evaluated every 15s on closed 1-minute bars by `StrategyRunner`. `backend/scheduler.py` drives the engine (`engine_tick` 1s, `strategy_tick` 15s, `equity_snapshot` 30s, `prune` 1h) — this replaces the old single moving-average bot in `bot.py`, which has been deleted.
+- **Known gap** – account state is warm-started from the last persisted snapshot on restart, not replayed deterministically from the `fills` log, so a crash between a fill and its DB commit can still diverge (tracked as H5 in `TODO.md`).
 
 ## Project Structure
 
@@ -63,15 +64,15 @@ python3 -m pytest -q
 CryptoTradeApp/
 ├── backend/
 │   ├── main.py                 # FastAPI app & routes
-│   ├── bot.py                  # Legacy bot compatibility shim
+│   ├── scheduler.py             # Engine background jobs (engine_tick, strategy_tick, ...)
 │   ├── config.py               # Back-compat config shim
 │   ├── settings.py             # Pydantic-settings config
 │   ├── models.py               # SQLAlchemy ORM models
 │   ├── database.py             # DB connection & init
 │   ├── requirements.txt         # Python dependencies
 │   ├── feeds/                  # Market data feeds (Coinbase, Binance, synthetic)
-│   ├── engine/                 # Paper trading engine, broker, risk, metrics
-│   ├── strategies/             # Trading strategies
+│   ├── engine/                 # Paper trading engine, broker, risk, metrics, runner
+│   ├── strategies/             # Trading strategies (sma_crossover, rsi_reversion, momentum_breakout)
 │   ├── tests/                  # Backend tests (pytest)
 │   └── crypto.db               # SQLite database
 ├── frontend/

@@ -85,6 +85,27 @@ class MarketState:
             self.open_candles.clear()
             return closed
 
+    def on_tick_batch(self, raw_ticks: List[Dict]) -> List[Optional[Candle]]:
+        """Convenience wrapper: build Tick objects from plain dicts and feed them
+        through on_tick(). Each dict needs at least symbol/price; bid/ask/source/ts
+        default sensibly. Mainly useful for tests and REPL-style seeding.
+        """
+        results = []
+        for raw in raw_ticks:
+            tick = Tick(
+                symbol=raw["symbol"],
+                price=raw["price"],
+                ts=raw.get("ts") or datetime.now(timezone.utc),
+                source=raw.get("source", "test"),
+                bid=raw.get("bid"),
+                ask=raw.get("ask"),
+                volume_24h=raw.get("volume_24h"),
+                change_24h_pct=raw.get("change_24h_pct"),
+                seq=raw.get("seq"),
+            )
+            results.append(self.on_tick(tick))
+        return results
+
     def on_tick(self, tick: Tick) -> Optional[Candle]:
         """Processes an incoming tick: updates tick cache, aggregates OHLC, rolls candle on rollover.
 

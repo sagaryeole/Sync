@@ -28,6 +28,10 @@ coverage/
 # ---- Editor & OS ----
 .DS_Store
 .idea/
+
+# ---- Local browser-automation debug artifacts ----
+.playwright-mcp/
+/frontend-screenshot*.png
 *.swp
 *.swo
 
