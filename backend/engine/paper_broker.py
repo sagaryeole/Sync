@@ -130,6 +130,7 @@ class PaperBroker:
         min_notional: float = 10.0,
         stale_price_seconds: float = 30.0,
         tradable_symbols: Optional[set] = None,
+        max_open_positions: int = 4,
     ):
         self.market = market_state
         self.taker_fee_bps = taker_fee_bps
@@ -138,7 +139,8 @@ class PaperBroker:
         self.impact_notional = impact_notional
         self.min_notional = min_notional
         self.stale_price_seconds = stale_price_seconds
-        self.tradable_symbols = tradable_symbols  # None = all symbols tradable
+        self.tradable_symbols = tradable_symbols
+        self.max_open_positions = max_open_positions  # None = all symbols tradable
 
     def get_quote(self, symbol: str) -> Optional[Quote]:
         """Build a quote from the latest tick in MarketState.
@@ -160,6 +162,7 @@ class PaperBroker:
 
         # Ensure bid <= ask (fix any inverted quotes)
         if bid > ask:
+            logger.warning("Inverted quote detected for %s: bid=%.8f ask=%.8f — swapping", symbol, bid, ask)
             bid, ask = ask, bid
 
         mid = (bid + ask) / 2.0
@@ -453,7 +456,7 @@ class PaperBroker:
         if order.side == OrderSide.BUY:
             pos = account.get_position(order.symbol)
             if pos is None or not pos.is_open:
-                if account.open_position_count() >= 4:  # max_open_positions
+                if account.open_position_count() >= self.max_open_positions:
                     return RejectReason.MAX_POSITIONS
 
         return None

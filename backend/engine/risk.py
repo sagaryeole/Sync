@@ -67,8 +67,19 @@ class RiskManager:
         symbol: str,
         entry_price: float,
         marks: Dict[str, float],
+        size_scale: float = 1.0,
     ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[str]]:
         """Size an order based on risk rules.
+
+        Args:
+            size_scale: conviction multiplier in (0, 1] applied to the risk
+                budget. Defaults to 1.0 (full budget) so existing callers and
+                strategies that do not express conviction are unaffected. A
+                volatility-targeting strategy passes its Decision.strength
+                here — see strategies/trend_ensemble.py. It scales the risk
+                fraction *before* the caps and the min-notional floor, so a
+                low-conviction signal shrinks the position rather than
+                bypassing any risk limit.
 
         Returns (quantity, stop_loss_price, take_profit_price, reject_reason).
         If reject_reason is not None, the order should not be placed.
@@ -102,14 +113,23 @@ class RiskManager:
         if stop_distance <= _EPS:
             return None, None, None, "INVALID_STOP_DISTANCE"
 
-        # Risk amount = equity * risk_per_trade_pct
-        risk_amount = equity * self.config.risk_per_trade_pct
+        # H1/H10: a non-finite or out-of-range scale must never silently
+        # inflate a position — clamp rather than trust the caller.
+        if not math.isfinite(size_scale) or size_scale <= 0.0:
+            return None, None, None, "INVALID_SIZE_SCALE"
+        size_scale = min(1.0, size_scale)
+
+        # Risk amount = equity * risk_per_trade_pct * conviction
+        risk_amount = equity * self.config.risk_per_trade_pct * size_scale
 
         # Quantity = risk_amount / stop_distance
         quantity = risk_amount / stop_distance
 
-        # Cap at max_position_pct of equity
-        max_notional = equity * self.config.max_position_pct
+        # Cap at max_position_pct of equity, also scaled by conviction — so a
+        # low-conviction signal in a low-volatility symbol (where the
+        # risk-based size would otherwise hit the cap) still takes a smaller
+        # position instead of the maximum one.
+        max_notional = equity * self.config.max_position_pct * size_scale
         max_qty = max_notional / entry_price
         if quantity > max_qty:
             quantity = max_qty

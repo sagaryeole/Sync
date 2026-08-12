@@ -197,6 +197,16 @@ class MarketState:
                             source=last_c.source
                         )
                         self.last_ticks[sym] = mock_tick
+                        # Warm tick history with a few synthetic ticks so strategies
+                        # that use recent_ticks() have data on startup.
+                        for i in range(10):
+                            hist_tick = Tick(
+                                symbol=sym,
+                                price=float(last_c.close),
+                                ts=last_c.open_time - timedelta(minutes=10-i),
+                                source=last_c.source
+                            )
+                            self.tick_history[sym].append(hist_tick)
                         logger.info("Warmed last tick for %s from DB: %f", sym, mock_tick.price)
         except Exception as e:
             logger.error("Error warming MarketState from DB: %s", e)

@@ -2,11 +2,11 @@
 from datetime import datetime, timezone
 from typing import List
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from database import get_session
-from models import Portfolio, TradeLog, Asset, PriceTicker
+from models import Portfolio, TradeLog, Asset, PriceTicker, Strategy as StrategyModel
 from pydantic import BaseModel, Field, field_validator
 from feeds.symbols import SYMBOLS
 
@@ -163,34 +163,64 @@ def get_portfolio(symbol: str, db: Session = Depends(get_session)):
 @router.post("/trade", response_model=ExecuteTradeResponse, status_code=201)
 def execute_trade_endpoint(request: ExecuteTradeRequest, db: Session = Depends(get_session)):
     if request.type not in ("BUY", "SELL"):
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="Invalid trade type")
     if request.quantity < 0:
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="Quantity must be non-negative")
     asset = db.query(Asset).filter_by(symbol=request.symbol).first()
     if not asset:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Asset not found")
+
+    quantity = float(request.quantity)
+
+    # Route manual trades through the engine when available so they share
+    # the same risk checks, SL/TP, and persistence as algorithmic trades.
+    # Fall back to the legacy path when the engine has not initialized the
+    # manual strategy (e.g. in isolated test contexts).
+    from main import ENGINE
+    manual_strategy = db.query(StrategyModel).filter_by(key="manual").first()
+    if manual_strategy is not None:
+        account = ENGINE.get_account(manual_strategy.id)
+        if account is not None:
+            if request.type == "SELL" and quantity == 0:
+                pos = account.get_position(request.symbol)
+                if pos is None or pos.quantity <= 0:
+                    raise HTTPException(status_code=400, detail="Not enough holdings to sell")
+                quantity = pos.quantity
+
+            fill, reason = ENGINE.submit_order(
+                strategy_id=manual_strategy.id,
+                symbol=request.symbol,
+                side=request.type,
+                order_type="MARKET",
+                quantity=quantity,
+            )
+            if fill is None:
+                raise HTTPException(status_code=400, detail=reason or "ORDER_REJECTED")
+
+            return {
+                "status": "trade executed",
+                "type": request.type,
+                "symbol": request.symbol,
+                "quantity": fill.quantity,
+                "price": fill.price,
+            }
+
+    # Legacy fallback — uses the old portfolio table directly.
     latest_price = db.query(PriceTicker).filter_by(symbol=request.symbol).order_by(
         PriceTicker.timestamp.desc()
     ).first()
     if not latest_price:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="No price data for asset")
     price = float(latest_price.price)
 
-    quantity = float(request.quantity)
     if request.type == "SELL" and quantity == 0:
         portfolio = db.query(Portfolio).filter_by(symbol=request.symbol).first()
         if not portfolio or float(portfolio.quantity) <= 0:
-            from fastapi import HTTPException
-            raise HTTPException(status_code=400, detail="Not enough balance to sell")
+            raise HTTPException(status_code=400, detail="Not enough holdings to sell")
         quantity = float(portfolio.quantity)
 
     success = _legacy_execute_trade(db, request.type, request.symbol, quantity, price)
     if not success:
-        from fastapi import HTTPException
         if request.type == "BUY":
             raise HTTPException(status_code=400, detail="Insufficient USD balance")
         else:

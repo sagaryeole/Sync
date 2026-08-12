@@ -23,6 +23,9 @@ class FeedManager:
         }
         self.active_provider_name: Optional[str] = None
         self.active_task: Optional[asyncio.Task] = None
+        self._stream_task: Optional[asyncio.Task] = None
+        self._watchdog_task: Optional[asyncio.Task] = None
+        self._failback_task: Optional[asyncio.Task] = None
         self.last_tick_time: Optional[datetime] = None
         self.reconnect_count = 0
         self.status_since = datetime.now(timezone.utc)
@@ -112,9 +115,9 @@ class FeedManager:
         self.status_since = datetime.now(timezone.utc)
         
         # Start loops
-        asyncio.create_task(self._watchdog_loop())
-        asyncio.create_task(self._failback_loop(symbols))
-        asyncio.create_task(self._stream_loop(symbols))
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+        self._failback_task = asyncio.create_task(self._failback_loop(symbols))
+        self._stream_task = asyncio.create_task(self._stream_loop(symbols))
 
     async def _stream_loop(self, symbols: List[str]):
         attempt = 0
@@ -267,8 +270,13 @@ class FeedManager:
 
     async def stop(self):
         self.is_running = False
-        if self.active_task:
-            self.active_task.cancel()
+        for task in (self._stream_task, self._watchdog_task, self._failback_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         if self.recorder:
             self.recorder.close()
         logger.info("Feed manager stopped.")

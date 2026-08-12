@@ -1,7 +1,9 @@
+import { fmtUsd, fmtPct, signClass } from '../../lib/format';
+
 interface Ticker {
   symbol: string;
-  price: number;
-  change?: number;
+  price: number | null | undefined;
+  change?: number | null;
 }
 
 interface Props {
@@ -9,36 +11,28 @@ interface Props {
 }
 
 export default function TickerStrip({ tickers }: Props) {
+  if (!tickers.length) {
+    return (
+      <div className="border-b border-slate-800 px-6 py-2 text-sm text-slate-500">
+        Waiting for market data…
+      </div>
+    );
+  }
+
   return (
-    <div style={{
-      display: 'flex',
-      gap: '0.75rem',
-      padding: '0.5rem 1.5rem',
-      overflowX: 'auto',
-      borderBottom: '1px solid #1e293b',
-    }}>
-      {tickers.map(t => (
+    <div className="flex gap-3 overflow-x-auto border-b border-slate-800 px-6 py-2">
+      {tickers.map((t) => (
         <div
           key={t.symbol}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '0.5rem',
-            padding: '0.25rem 0.75rem',
-            background: '#1e293b',
-            borderRadius: '9999px',
-            border: '1px solid #334155',
-            fontSize: '0.875rem',
-            whiteSpace: 'nowrap',
-          }}
+          className="flex shrink-0 items-center gap-2 whitespace-nowrap rounded-full border border-slate-800 bg-slate-900 px-3 py-1 text-sm"
         >
-          <span style={{
-            color: t.change === undefined ? '#cbd5e1' : t.change >= 0 ? '#4ade80' : '#f87171',
-            fontWeight: 600,
-          }}>
-            {t.symbol}
-          </span>
-          <span style={{ color: '#94a3b8' }}>${t.price.toFixed(2)}</span>
+          <span className="font-semibold text-slate-200">{t.symbol}</span>
+          <span className="tabular-nums text-slate-400">{fmtUsd(t.price)}</span>
+          {t.change !== undefined && t.change !== null && (
+            <span className={`tabular-nums text-xs ${signClass(t.change)}`}>
+              {fmtPct(t.change)}
+            </span>
+          )}
         </div>
       ))}
     </div>

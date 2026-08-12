@@ -1,38 +1,38 @@
-type Status = 'connected' | 'disconnected' | 'degraded';
+import { useMarketStore, FeedStatus } from '../../store/marketSlice';
 
 interface Props {
-  status?: Status;
+  /** Omit to read the shared feed status from the store (the usual case). */
+  status?: FeedStatus;
   label?: string;
 }
 
-const COLORS: Record<Status, string> = {
-  connected: '#4ade80',
-  disconnected: '#f87171',
-  degraded: '#fbbf24',
+const DOT: Record<FeedStatus, string> = {
+  connected: 'bg-emerald-400',
+  disconnected: 'bg-rose-400',
+  degraded: 'bg-amber-400',
 };
 
-export default function ConnectionPill({ status = 'disconnected', label }: Props) {
+const TEXT: Record<FeedStatus, string> = {
+  connected: 'text-emerald-400',
+  disconnected: 'text-rose-400',
+  degraded: 'text-amber-400',
+};
+
+export default function ConnectionPill({ status, label }: Props) {
+  const storeStatus = useMarketStore((s) => s.feedStatus);
+  const provider = useMarketStore((s) => s.feedProvider);
+  // Defaulting the prop to 'disconnected' is what made TopBar permanently red
+  // regardless of the real feed state — fall back to the store instead.
+  const effective = status ?? storeStatus;
+
   return (
-    <div style={{
-      display: 'inline-flex',
-      alignItems: 'center',
-      gap: '0.5rem',
-      padding: '0.25rem 0.75rem',
-      borderRadius: '9999px',
-      border: '1px solid #334155',
-      background: '#1e293b',
-      fontSize: '0.75rem',
-      fontWeight: 500,
-      textTransform: 'uppercase',
-      letterSpacing: '0.05em',
-    }}>
-      <span style={{
-        width: 8,
-        height: 8,
-        borderRadius: '50%',
-        background: COLORS[status],
-      }} />
-      {label || status}
+    <div
+      className="inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs font-medium uppercase tracking-wider"
+      title={provider ? `Provider: ${provider}` : undefined}
+    >
+      <span className={`h-2 w-2 rounded-full ${DOT[effective]}`} />
+      <span className={TEXT[effective]}>{label || effective}</span>
+      {provider && <span className="text-slate-500 normal-case">· {provider}</span>}
     </div>
   );
 }

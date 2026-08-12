@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import queue
 import secrets
 import time
 from datetime import datetime, timezone
-from typing import Optional, Set
+from typing import Dict, Optional, Set
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, HTTPException
 from starlette.websockets import WebSocketState
@@ -41,10 +42,14 @@ MAX_MESSAGE_SIZE = 1024 * 1024  # 1 MB — H8 inbound cap
 KNOWN_SYMBOLS: Set[str] = set(SYMBOLS.keys())
 
 # H2: single-use WS connect tokens
-_WS_TOKENS: Set[str] = set()
+_WS_TOKENS: Dict[str, float] = {}
 _TOKEN_TTL = 300  # 5 minutes
+_MAX_TOKENS = 1000
 
-# Keep the pump running even when no WS clients are connected
+# The pump runs for the whole app lifetime — started explicitly from
+# main.py's lifespan (step 1 below applies), not lazily on first WS
+# connection, so events emitted before any client connects (fills right
+# after startup, feed status changes, etc.) aren't stranded in EVENT_BUS.
 _pump_running = False
 _pump_task: Optional[asyncio.Task] = None
 
@@ -57,12 +62,11 @@ async def _event_bus_pump():
     to the hub, which fans out to subscribed WebSocket connections.
     """
     global _pump_running
-    _pump_running = True
     logger.info("Event bus pump started")
     while _pump_running:
         try:
             event = EVENT_BUS.get_nowait()
-        except Exception:
+        except queue.Empty:
             await asyncio.sleep(0.01)
             continue
 
@@ -76,14 +80,39 @@ async def _event_bus_pump():
             data=data,
         )
         await HUB.publish(envelope)
+    logger.info("Event bus pump stopped")
 
 
-def _ensure_pump():
-    """Start the event bus pump if it's not running."""
-    global _pump_task
+def start_event_pump() -> None:
+    """Start the event bus pump. Called once from the app lifespan startup."""
+    global _pump_running, _pump_task
+    if _pump_task is not None and not _pump_task.done():
+        return
+    _pump_running = True
+    loop = asyncio.get_event_loop()
+    _pump_task = loop.create_task(_event_bus_pump())
+
+
+async def stop_event_pump() -> None:
+    """Stop the event bus pump. Called once from the app lifespan shutdown."""
+    global _pump_running, _pump_task
+    _pump_running = False
+    if _pump_task is not None:
+        try:
+            await asyncio.wait_for(_pump_task, timeout=2.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            _pump_task.cancel()
+        _pump_task = None
+
+
+def _ensure_pump() -> None:
+    """Defensive fallback: start the pump if it somehow isn't running yet.
+
+    Normal startup always calls start_event_pump() from the lifespan before
+    any client can connect, so this is a safety net, not the primary path.
+    """
     if _pump_task is None or _pump_task.done():
-        loop = asyncio.get_event_loop()
-        _pump_task = loop.create_task(_event_bus_pump())
+        start_event_pump()
 
 
 def _get_allowed_origins() -> Set[str]:
@@ -106,17 +135,24 @@ def _validate_origin(origin: Optional[str]) -> bool:
 
 
 async def _send_envelope(ws: WebSocket, conn: Connection, envelope: Envelope) -> bool:
-    """Send an envelope over the WebSocket, assigning the per-connection seq.
+    """Enqueue an envelope for the connection's writer task to send.
 
-    Returns True if sent, False on error (connection should close).
+    The `_writer_task` is the *only* coroutine allowed to call
+    `ws.send_text()`. Two coroutines calling it concurrently on the same
+    WebSocket (e.g. this inbound-message handler replying to a ping while
+    the writer is mid-send of a published tick) can interleave frames on
+    the wire — ASGI/Starlette gives no guarantee that concurrent sends are
+    serialized. Routing every outbound message through the bounded queue
+    means there is exactly one writer, always, so replies, confirmations,
+    initial-state snapshots, and published topic messages can never race.
+
+    `seq` is assigned by the writer at actual send time (not here), so a
+    message that gets evicted under backpressure never "uses up" a seq
+    number that was never really sent.
+
+    Returns True if enqueued, False if the connection should close (1013).
     """
-    envelope.seq = conn.next_seq()
-    try:
-        await ws.send_text(envelope.to_json())
-        return True
-    except Exception as e:
-        logger.debug("WS send failed for conn %s: %s", conn.id[:8], e)
-        return False
+    return await conn.send_envelope(envelope)
 
 
 async def _send_error(ws: WebSocket, conn: Connection, code: str, message: str) -> None:
@@ -189,8 +225,12 @@ async def _send_initial_state(ws: WebSocket, conn: Connection, topic: str) -> No
 async def _writer_task(ws: WebSocket, conn: Connection) -> None:
     """Background task that drains the connection queue and sends to the WS.
 
-    Runs concurrently with the inbound message reader. Exits when the
-    connection is closed or the task is cancelled.
+    This is the *sole* owner of outbound operations on `ws` — every send and
+    the eventual close both happen only here (see `_send_envelope`'s
+    docstring for why). Runs concurrently with the inbound message reader.
+    Exits when the connection is closed or the task is cancelled, and closes
+    the socket itself with the recorded close code (e.g. 1013 on backpressure
+    overflow) rather than leaving it dangling for the reader loop to notice.
     """
     try:
         while not conn.closed:
@@ -208,7 +248,14 @@ async def _writer_task(ws: WebSocket, conn: Connection) -> None:
                 conn.closed = True
                 break
     except asyncio.CancelledError:
-        pass
+        raise
+    finally:
+        if conn.closed:
+            try:
+                if ws.client_state == WebSocketState.CONNECTED:
+                    await ws.close(code=conn.close_code or 1000)
+            except Exception:
+                pass
 
 
 async def _heartbeat_task(ws: WebSocket, conn: Connection) -> None:
@@ -232,12 +279,21 @@ async def _heartbeat_task(ws: WebSocket, conn: Connection) -> None:
         pass
 
 
+def _cleanup_expired_tokens() -> None:
+    """Remove expired tokens to prevent memory leak."""
+    now = time.time()
+    expired = [t for t, created in _WS_TOKENS.items() if now - created > _TOKEN_TTL]
+    for t in expired:
+        del _WS_TOKENS[t]
+
+
 @router.get("/ws/token")
 def get_ws_token():
+    _cleanup_expired_tokens()
     token = secrets.token_urlsafe(32)
-    _WS_TOKENS.add(token)
-    if len(_WS_TOKENS) > 1000:
-        _WS_TOKENS.pop()
+    _WS_TOKENS[token] = time.time()
+    while len(_WS_TOKENS) > _MAX_TOKENS:
+        _WS_TOKENS.pop(next(iter(_WS_TOKENS)))
     return {"token": token, "expires_in": _TOKEN_TTL}
 
 
@@ -264,12 +320,13 @@ async def websocket_endpoint(
         await ws.close(code=WS_CLOSE_POLICY_VIOLATION, reason="Invalid origin")
         return
 
-    # H2: Validate connect token
-    if token not in _WS_TOKENS:
-        logger.warning("WS rejected: invalid token")
+    # H2: Validate connect token (with expiry)
+    token_age = _WS_TOKENS.get(token)
+    if token_age is None or (time.time() - token_age) > _TOKEN_TTL:
+        logger.warning("WS rejected: invalid or expired token")
         await ws.close(code=WS_CLOSE_POLICY_VIOLATION, reason="Invalid token")
         return
-    _WS_TOKENS.discard(token)
+    del _WS_TOKENS[token]
 
     # Get client IP
     client_ip = ws.client.host if ws.client else "unknown"

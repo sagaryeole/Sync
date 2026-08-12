@@ -219,3 +219,98 @@ def donchian(highs: List[float], lows: List[float],
     upper = max(highs[-window:])
     middle = (lower + upper) / 2.0
     return lower, middle, upper
+
+
+# ---------------------------------------------------------------------------
+# Series primitives (for multi-lookback / volatility-scaled signals)
+#
+# These return whole series rather than a single trailing value. A signal that
+# has to be normalised by its *own* historical dispersion (see
+# strategies/trend_ensemble.py) needs the history, and recomputing a trailing
+# indicator once per bar is O(n^2). Everything below is single-pass O(n).
+# ---------------------------------------------------------------------------
+
+def ema_series(prices: List[float], span: int) -> List[float]:
+    """Full EMA series using the *standard* smoothing alpha = 2/(span+1).
+
+    Note this deliberately differs from ``ema()`` above, which uses Wilder
+    smoothing (alpha = 1/span). Wilder smoothing is the correct convention
+    for RSI/ATR and is kept there for exactly that reason; trend/momentum
+    signals conventionally use the standard EMA, which reacts about twice as
+    fast for the same nominal span. Mixing the two silently would make a
+    "60-bar" trend behave like a 120-bar one.
+
+    Returns a list the same length as ``prices`` (seeded with prices[0]).
+    Returns ``[]`` for empty input or ``span <= 0``.
+    """
+    if span <= 0 or not prices:
+        return []
+    alpha = 2.0 / (span + 1.0)
+    out = [prices[0]]
+    prev = prices[0]
+    for p in prices[1:]:
+        prev = alpha * p + (1.0 - alpha) * prev
+        out.append(prev)
+    return out
+
+
+def rolling_stdev_series(values: List[float], window: int) -> List[Optional[float]]:
+    """Rolling sample std-dev (ddof=1), single pass via running sums.
+
+    Element ``i`` is the std-dev of ``values[i-window+1 : i+1]``, or ``None``
+    where there is not yet a full window. Uses the sum/sum-of-squares form,
+    with a negative-variance clamp for float cancellation.
+    """
+    n = len(values)
+    if window < 2 or n == 0:
+        return [None] * n
+
+    out: List[Optional[float]] = [None] * n
+    s = 0.0
+    s2 = 0.0
+    for i, v in enumerate(values):
+        s += v
+        s2 += v * v
+        if i >= window:
+            old = values[i - window]
+            s -= old
+            s2 -= old * old
+        if i >= window - 1:
+            mean = s / window
+            var = (s2 - window * mean * mean) / (window - 1)
+            out[i] = math.sqrt(var) if var > 0.0 else 0.0
+    return out
+
+
+def log_returns(prices: List[float]) -> List[float]:
+    """Bar-over-bar log returns. Non-positive prices yield a 0.0 return
+    rather than raising — a bad tick must never poison the series (H1).
+    """
+    out: List[float] = []
+    for i in range(1, len(prices)):
+        prev, cur = prices[i - 1], prices[i]
+        if prev <= 0 or cur <= 0:
+            out.append(0.0)
+        else:
+            out.append(math.log(cur / prev))
+    return out
+
+
+def realized_vol(prices: List[float], window: int,
+                 bars_per_year: int = 525_600) -> Optional[float]:
+    """Annualised realised volatility from log returns over ``window`` bars.
+
+    ``bars_per_year`` defaults to the 1-minute bar count (365*24*60). Returns
+    ``None`` when there is insufficient history, and never returns 0.0 —
+    a zero would make any vol-scaled position size infinite, so a flat
+    window returns ``None`` instead (H10: guard every division).
+    """
+    if window < 2 or len(prices) < window + 1:
+        return None
+    rets = log_returns(prices[-(window + 1):])
+    if len(rets) < 2:
+        return None
+    sd = _sample_stddev(rets)
+    if sd <= 1e-12:
+        return None
+    return sd * math.sqrt(bars_per_year)

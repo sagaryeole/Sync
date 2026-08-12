@@ -152,6 +152,24 @@ class StrategyRunner:
             if dry_run:
                 pass  # shadow mode: evaluate, but never submit
             elif decision.action == Action.BUY:
+                # Strategies that express conviction (volatility targeting)
+                # opt in via `uses_strength_sizing`; everything else keeps the
+                # full risk budget, so existing strategies are unaffected.
+                size_scale = 1.0
+                if getattr(strategy, "uses_strength_sizing", False):
+                    # A strength of 0 would be a rejected order rather than a
+                    # skipped one — treat "no conviction" as "don't trade".
+                    if decision.strength <= 0.0:
+                        return RunResult(
+                            strategy_id=cfg.strategy_id,
+                            strategy_key=cfg.key,
+                            symbol=symbol,
+                            decision=decision,
+                            last_price=last_price,
+                            reject_reason="ZERO_CONVICTION",
+                        )
+                    size_scale = decision.strength
+
                 fill, reject_reason = self.engine.submit_order(
                     strategy_id=cfg.strategy_id,
                     symbol=symbol,
@@ -159,6 +177,7 @@ class StrategyRunner:
                     order_type="MARKET",
                     quantity=None,
                     attach_stops=True,
+                    size_scale=size_scale,
                 )
             elif decision.action == Action.SELL:
                 if strategy_position is not None \

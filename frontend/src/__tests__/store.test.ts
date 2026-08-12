@@ -44,23 +44,44 @@ describe('marketSlice', () => {
 });
 
 describe('portfolioSlice', () => {
-  it('fetchPortfolio populates portfolio array', async () => {
-    const mockData = [
-      { symbol: 'BTC', balance: 10000, quantity: 0.2, cost_basis: 45000 },
-      { symbol: 'ETH', balance: 5000, quantity: 1.5, cost_basis: 2800 },
+  it('fetchPortfolio populates positions and account', async () => {
+    const mockPositions = [
+      { id: 1, strategy_id: 1, symbol: 'BTC', quantity: 0.2, avg_entry_price: 45000, realized_pnl: 0, stop_loss_price: 44100, take_profit_price: 46800, opened_at: '2024-01-01T00:00:00Z', updated_at: '2024-01-01T00:00:00Z' },
     ];
-    vi.mocked(api.get).mockResolvedValue({ data: mockData });
+    const mockAccount = [
+      { id: 1, strategy_id: 1, cash: 91000, realized_pnl: 0, fees_paid: 0, peak_equity: 100000, is_halted: false, halt_reason: '', updated_at: '2024-01-01T00:00:00Z' },
+    ];
+    vi.mocked(api.get).mockImplementation((url: string) => {
+      if (url.includes('/positions')) return Promise.resolve({ data: mockPositions });
+      if (url.includes('/portfolio')) return Promise.resolve({ data: mockAccount });
+      return Promise.resolve({ data: null });
+    });
 
-    await usePortfolioStore.getState().fetchPortfolio();
+    await usePortfolioStore.getState().fetchPortfolio(1);
 
-    expect(usePortfolioStore.getState().portfolio).toEqual(mockData);
+    expect(usePortfolioStore.getState().positions).toEqual(mockPositions);
+    expect(usePortfolioStore.getState().account).toEqual(mockAccount[0]);
+  });
+
+  it('fetchPortfolio handles null strategyId', async () => {
+    vi.mocked(api.get).mockResolvedValue({ data: null });
+
+    await usePortfolioStore.getState().fetchPortfolio(null);
+
+    expect(usePortfolioStore.getState().positions).toEqual([]);
+    expect(usePortfolioStore.getState().account).toBeNull();
   });
 
   it('fetchPortfolio handles non-array response', async () => {
-    vi.mocked(api.get).mockResolvedValue({ data: {} });
+    vi.mocked(api.get).mockImplementation((url: string) => {
+      if (url.includes('/positions')) return Promise.resolve({ data: {} });
+      if (url.includes('/portfolio')) return Promise.resolve({ data: [] });
+      return Promise.resolve({ data: null });
+    });
 
-    await usePortfolioStore.getState().fetchPortfolio();
+    await usePortfolioStore.getState().fetchPortfolio(1);
 
-    expect(usePortfolioStore.getState().portfolio).toEqual([]);
+    expect(usePortfolioStore.getState().positions).toEqual([]);
+    expect(usePortfolioStore.getState().account).toBeNull();
   });
 });

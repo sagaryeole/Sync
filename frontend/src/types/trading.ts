@@ -67,13 +67,22 @@ export interface Strategy {
   created_at: string;
 }
 
+/**
+ * All *_pct fields are FRACTIONS (0.05 = 5%), matching engine/metrics.py.
+ * Render them with fmtRatioPct, not fmtPct, or they read 100x too small.
+ *
+ * Fields are nullable because the API maps non-finite values to null:
+ * profit_factor is legitimately infinite when there are wins but no losses,
+ * and Infinity is not valid JSON.
+ */
 export interface StrategyMetrics {
-  win_rate: number;
-  avg_win: number;
-  avg_loss: number;
-  profit_factor: number;
-  max_drawdown_pct: number;
-  intraday_sharpe: number;
-  trade_count: number;
-  avg_hold_time_seconds: number;
+  total_return_pct: number | null;
+  win_rate: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  profit_factor: number | null;
+  max_drawdown_pct: number | null;
+  intraday_sharpe: number | null;
+  trade_count: number | null;
+  avg_hold_time_seconds: number | null;
 }

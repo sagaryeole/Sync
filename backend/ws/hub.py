@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Set
 from collections import defaultdict
 
-from ws.protocol import Envelope, make_envelope, is_coalesceable
+from ws.protocol import Envelope, is_coalesceable
 
 logger = logging.getLogger("ws.hub")
 
@@ -64,6 +64,11 @@ class Connection:
     seq: int = 0
     ip: str = ""
     closed: bool = False
+    # Close code the writer task should use when it notices `closed`. Set
+    # alongside `closed` so the actual socket close (owned solely by the
+    # writer task — see api/ws_routes.py) uses the right code, e.g. 1013
+    # for backpressure instead of a plain 1000.
+    close_code: Optional[int] = None
 
     def next_seq(self) -> int:
         """Get the next monotonic sequence number."""
@@ -101,10 +106,16 @@ class Connection:
                     return True
                 except asyncio.QueueFull:
                     # Still full after eviction — close
-                    return False
-            else:
-                # No coalesceable message to evict — must close
-                return False
+                    pass
+
+            # No coalesceable message to evict (or still full after eviction) —
+            # mark for a 1013 close. Set both flags here, centrally, so every
+            # caller (Hub.publish, the WS route's direct sends) gets consistent
+            # behavior without having to remember to do it themselves. The
+            # actual socket close is performed solely by the writer task.
+            self.closed = True
+            self.close_code = WS_CLOSE_TRY_AGAIN_LATER
+            return False
 
     def _evict_oldest_coalesceable(self) -> bool:
         """Try to remove the oldest coalesceable message from the queue.
@@ -243,14 +254,15 @@ class Hub:
             if not conn.is_subscribed(envelope.topic):
                 continue
             ok = await conn.send_envelope(envelope)
-            if not ok:
-                # Connection queue is full with non-coalesceable messages.
-                # Mark for closure — the _writer task will close with 1013.
+            if ok:
+                delivered += 1
+            else:
+                # send_envelope already set conn.closed/close_code (1013) —
+                # the writer task will perform the actual close.
                 logger.warning(
                     "Conn %s: queue overflow, marking for 1013 close",
                     conn.id[:8],
                 )
-                conn.closed = True
         return delivered
 
     async def publish_to_connection(self, conn: Connection, envelope: Envelope) -> bool:

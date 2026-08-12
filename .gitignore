@@ -30,8 +30,10 @@ coverage/
 .idea/
 
 # ---- Local browser-automation debug artifacts ----
+# Root-level PNGs are only ever throwaway verification screenshots here.
+# Real assets belong in frontend/public or docs/, which this does not touch.
 .playwright-mcp/
-/frontend-screenshot*.png
+/*.png
 *.swp
 *.swo
 

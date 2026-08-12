@@ -41,7 +41,23 @@ npm run lint
 - `scheduler.py` – Engine background jobs: `engine_tick` (1s), `strategy_tick` (15s), `equity_snapshot` (30s), `prune` (1h). Replaces the deleted `bot.py`'s single MA-crossover cycle.
 - `feeds/` – Market data ingestion (Coinbase, Binance, synthetic, recorder, backfill, validation, manager)
 - `engine/` – Paper trading engine (`core.py`), broker (`paper_broker.py`), risk (`risk.py`), portfolio (`portfolio.py`), metrics (`metrics.py`), market state (`market_state.py`), strategy runner (`runner.py`)
-- `strategies/` – `sma_crossover`, `rsi_reversion`, `momentum_breakout`, plus `indicators.py`, `base.py`, `registry.py`
+- `strategies/` – `sma_crossover`, `rsi_reversion`, `momentum_breakout`, `trend_ensemble`, plus `indicators.py`, `base.py`, `registry.py`, `schemas.py`
+
+  > **Turnover is the dominant term, and it is measured, not assumed.** Replaying this repo's own
+  > candle history through each strategy with the real cost model (10bps taker + 1.5bps slippage,
+  > ~23bps round trip) gives: `sma_crossover` 36.8 round-trips/symbol/day → **-34.3% fees**,
+  > `momentum_breakout` 19.3/day → -17.9%, `rsi_reversion` 9.4/day → -8.7%. All three are net
+  > negative *because of turnover*, not because of parameter choice — their gross edge is
+  > +4.8%/-0.8%/+1.4% respectively. Any new strategy must be judged on **net** after costs, and
+  > any change that raises turnover needs to clear ~23bps per added round trip to break even.
+  >
+  > `trend_ensemble` is the reference implementation of the fix: multi-horizon EMA ensemble with
+  > Baz-style double normalisation, volatility targeting, a hysteresis band (entry 0.35 / exit
+  > 0.10) and an explicit pre-trade cost gate. Same data, same cost model: 2.0 round-trips/day,
+  > 1.8% fees. It is the only strategy that sizes by conviction — it sets
+  > `uses_strength_sizing = True`, which makes `engine/runner.py` pass `Decision.strength` into
+  > `RiskManager.size_order(size_scale=...)`. Without that flag a strategy gets the full risk
+  > budget, so the other three are unaffected.
 
   > `bot.py` is gone (Phase 2, step 37). Its two live call sites were carried over rather than
   > dropped: the legacy weighted-average cost-basis math moved verbatim into
@@ -142,6 +158,10 @@ npm run lint
 
 ### RiskManager
 - `size_order()`: risk 2% of equity / stop distance, capped at 20% notional, floored at min notional ($10)
+- `size_order(size_scale=...)`: optional conviction multiplier in (0, 1], default 1.0. Scales the
+  risk fraction **and** the notional cap, so low conviction shrinks the position rather than
+  bypassing a limit. Non-finite, zero, or negative values are rejected with `INVALID_SIZE_SCALE`;
+  values > 1 are clamped, never amplified.
 - SL 2% / TP 4% attached on entry
 - Max open positions: 4
 - Cooldown: 3 bars after close
@@ -207,8 +227,20 @@ npm run build
 
 ## Notes for Future Work
 
-- **WebSocket:** `docs/WS_PROTOCOL.md` is planned (step 41); no WS endpoint exists yet
-- **Frontend tests:** No Jest/Vitest configured yet; `store/selectors`, `api/ws`, `Watchlist`, `OrderTicket`, `ErrorBoundary` need coverage
+- **WebSocket:** `/ws` is live per `docs/WS_PROTOCOL.md` (Phase 3). Every documented topic now
+  actually streams, not just the initial-subscribe snapshot: `engine/events.py:emit()` is called
+  from `scheduler.py` (order/fill/position/equity/signal, only after the DB commit that produced
+  them succeeds — H5's durability rule extended to events) and from `feeds/manager.py`'s
+  `on_status` callback (feed); `main.py:tick_broadcaster_task` publishes batched ticks + live
+  in-progress candles straight to the hub at `broadcast_hz` (no EVENT_BUS hop needed — it already
+  runs on the asyncio loop); `main.py:candle_flusher_task` publishes closed candles the same way.
+  All outbound sends on a connection go through its bounded queue and a single writer task
+  (`api/ws_routes.py:_writer_task`) — nothing else calls `ws.send_text()` — so replies/confirmations
+  can never interleave with published messages on the wire. The writer also owns the socket's
+  close, including the 1013 backpressure case, which used to just flag the connection without
+  ever actually closing it.
+- **Frontend tests:** Vitest configured (step 69); `lib/format`, `store/selectors`, `api/ws`,
+  `ErrorBoundary` have coverage.
 - **H5 (crash recovery):** account state is warm-started from the last persisted `portfolios`/`positions`
   snapshot on startup, not replayed deterministically from the `fills` log — a crash between a fill
   and its DB commit can still diverge. See `TODO.md` H5.

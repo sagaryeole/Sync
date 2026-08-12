@@ -43,48 +43,105 @@ describe('WSClient', () => {
   beforeEach(() => {
     MockWebSocket.instance = null;
     (globalThis as unknown as { WebSocket: typeof MockWebSocket }).WebSocket = MockWebSocket;
-    client = new WSClient('ws://localhost:8000/ws');
-    client.connect();
-    MockWebSocket.instance!.simulateOpen();
-    vi.useFakeTimers();
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      json: async () => ({ token: 'test-token' }),
+    })));
   });
 
-  afterEach(() => {
-    client.disconnect();
+  afterEach(async () => {
+    if (client) {
+      client.disconnect();
+    }
     vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
-  it('connect creates WebSocket', () => {
+  it('connect creates WebSocket with token', async () => {
+    client = new WSClient('ws://localhost:8000/ws');
+    await client.connect();
+    MockWebSocket.instance!.simulateOpen();
     expect(MockWebSocket.instance).not.toBeNull();
-    expect(MockWebSocket.instance!.url).toBe('ws://localhost:8000/ws');
+    expect(MockWebSocket.instance!.url).toBe('ws://localhost:8000/ws?token=test-token');
   });
 
-  it('onMessage registers handler', () => {
+  it('onMessage registers handler', async () => {
+    client = new WSClient('ws://localhost:8000/ws');
+    await client.connect();
+    MockWebSocket.instance!.simulateOpen();
     const handler = vi.fn();
     const remove = client.onMessage(handler);
     expect(typeof remove).toBe('function');
   });
 
-  it('subscribe adds topics and sends message', () => {
+  it('subscribe adds topics and sends message', async () => {
+    client = new WSClient('ws://localhost:8000/ws');
+    await client.connect();
+    MockWebSocket.instance!.simulateOpen();
     client.subscribe(['ticks', 'orders']);
     expect(MockWebSocket.instance!.send).toHaveBeenCalledWith(JSON.stringify({ op: 'subscribe', topics: ['ticks', 'orders'] }));
   });
 
-  it('unsubscribe removes topics and sends message', () => {
+  it('unsubscribe removes topics and sends message', async () => {
+    client = new WSClient('ws://localhost:8000/ws');
+    await client.connect();
+    MockWebSocket.instance!.simulateOpen();
     client.unsubscribe(['orders']);
     expect(MockWebSocket.instance!.send).toHaveBeenCalledWith(JSON.stringify({ op: 'unsubscribe', topics: ['orders'] }));
   });
 
-  it('disconnect closes socket', () => {
+  it('does not re-subscribe a topic another holder already has', async () => {
+    client = new WSClient('ws://localhost:8000/ws');
+    await client.connect();
+    MockWebSocket.instance!.simulateOpen();
+
+    client.subscribe(['feed']);
+    MockWebSocket.instance!.send.mockClear();
+    client.subscribe(['feed']); // second holder
+
+    expect(MockWebSocket.instance!.send).not.toHaveBeenCalled();
+  });
+
+  it('keeps a shared topic alive until the last holder unsubscribes', async () => {
+    // Regression: AppShell holds `feed` for the connection pill on every page
+    // while the terminal also lists `feed`. With a boolean subscription map,
+    // the terminal unmounting dropped the shared topic and froze the
+    // indicator as DISCONNECTED everywhere else.
+    client = new WSClient('ws://localhost:8000/ws');
+    await client.connect();
+    MockWebSocket.instance!.simulateOpen();
+
+    client.subscribe(['feed']); // AppShell
+    client.subscribe(['feed']); // TerminalPage
+    MockWebSocket.instance!.send.mockClear();
+
+    client.unsubscribe(['feed']); // TerminalPage unmounts
+    expect(MockWebSocket.instance!.send).not.toHaveBeenCalled();
+
+    client.unsubscribe(['feed']); // AppShell unmounts
+    expect(MockWebSocket.instance!.send).toHaveBeenCalledWith(
+      JSON.stringify({ op: 'unsubscribe', topics: ['feed'] }),
+    );
+  });
+
+  it('disconnect closes socket', async () => {
+    client = new WSClient('ws://localhost:8000/ws');
+    await client.connect();
+    MockWebSocket.instance!.simulateOpen();
     client.disconnect();
     expect(MockWebSocket.instance!.close).toHaveBeenCalled();
   });
 
-  it('connected returns true when open', () => {
+  it('connected returns true when open', async () => {
+    client = new WSClient('ws://localhost:8000/ws');
+    await client.connect();
+    MockWebSocket.instance!.simulateOpen();
     expect(client.connected).toBe(true);
   });
 
-  it('onmessage parses JSON and calls handlers', () => {
+  it('onmessage parses JSON and calls handlers', async () => {
+    client = new WSClient('ws://localhost:8000/ws');
+    await client.connect();
+    MockWebSocket.instance!.simulateOpen();
     const handler = vi.fn();
     client.onMessage(handler);
 
@@ -94,7 +151,10 @@ describe('WSClient', () => {
     expect(handler).toHaveBeenCalledWith(envelope);
   });
 
-  it('onmessage ignores malformed JSON', () => {
+  it('onmessage ignores malformed JSON', async () => {
+    client = new WSClient('ws://localhost:8000/ws');
+    await client.connect();
+    MockWebSocket.instance!.simulateOpen();
     const handler = vi.fn();
     client.onMessage(handler);
 

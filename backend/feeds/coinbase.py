@@ -26,6 +26,7 @@ class CoinbaseFeed(MarketFeed):
             return
 
         last_seq: Dict[str, int] = {}
+        last_gap_log: Dict[str, datetime] = {}
 
         while True:
             try:
@@ -72,10 +73,14 @@ class CoinbaseFeed(MarketFeed):
                                 if product_id in last_seq:
                                     expected = last_seq[product_id] + 1
                                     if seq != expected:
-                                        logger.warning(
-                                            "Coinbase sequence gap on %s: expected %d, got %d",
-                                            product_id, expected, seq
-                                        )
+                                        now = datetime.now(timezone.utc)
+                                        last_log = last_gap_log.get(product_id)
+                                        if last_log is None or (now - last_log).total_seconds() > 30:
+                                            logger.warning(
+                                                "Coinbase sequence gap on %s: expected %d, got %d",
+                                                product_id, expected, seq
+                                            )
+                                            last_gap_log[product_id] = now
                                 last_seq[product_id] = seq
 
                             try:

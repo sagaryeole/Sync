@@ -295,8 +295,8 @@ class TestH6RaceConditions:
         ok = engine.cancel_order(cid)
         assert ok is True
 
-        # Now a tick at the limit price should NOT fill the cancelled order
-        engine.on_tick_batch([{"symbol": "BTC", "price": 90.0}])
+        # Now tick at the limit price should NOT fill the cancelled order
+        engine.market.on_tick_batch([{"symbol": "BTC", "price": 90.0}])
         fills = engine.drain_pending_fills()
         assert len(fills) == 0  # cancelled order was not filled
 
@@ -340,7 +340,7 @@ class TestH2WSAllowedOrigin:
             # If we got here, the connection was accepted
             ws.send_text('{"op":"ping"}')
             data = json.loads(ws.receive_text())
-            assert data["type"] == "heartbeat"
+            assert data["type"] == "pong"
             try:
                 ws.__exit__(None, None, None)
             except Exception:
@@ -365,4 +365,4 @@ class TestH10GuardedDivision:
         from engine.portfolio import PortfolioAccount
         acct = PortfolioAccount(strategy_id=1, strategy_key="test", starting_cash=100000.0)
         acct.peak_equity = 0.0
-        assert acct.drawdown_pct == 0.0
+        assert acct.drawdown_pct({}) == 0.0

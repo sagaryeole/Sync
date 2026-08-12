@@ -65,6 +65,36 @@ class TestValidateParams:
         result = validate_params("unknown", {"anything": "goes"})
         assert result == {"anything": "goes"}
 
+    def test_dry_run_survives_validation(self):
+        """V4 shadow mode: dry_run isn't a field on any per-strategy schema —
+        it must not be dropped by pydantic's default extra="ignore"."""
+        result = validate_params("sma_crossover", {"fast": 5, "slow": 20, "dry_run": True})
+        assert result["dry_run"] is True
+        assert result["fast"] == 5 and result["slow"] == 20
+
+    def test_dry_run_absent_when_not_set(self):
+        result = validate_params("sma_crossover", {"fast": 5, "slow": 20})
+        assert "dry_run" not in result
+
+    def test_dry_run_false_is_not_included(self):
+        """Only an explicit True is carried through, so params_json stays
+        minimal for the common (live) case."""
+        result = validate_params("sma_crossover", {"fast": 5, "slow": 20, "dry_run": False})
+        assert "dry_run" not in result
+
+    def test_dry_run_survives_for_every_registered_strategy(self):
+        """Same guarantee for every schema, not just the one tested above —
+        this is what would have caught the original bug on any strategy."""
+        from strategies.schemas import SCHEMAS
+        for key in SCHEMAS:
+            result = validate_params(key, {"dry_run": True})
+            assert result.get("dry_run") is True, f"dry_run dropped for {key}"
+
+    def test_dry_run_survives_passthrough_for_unknown_strategy(self):
+        result = validate_params("unknown", {"anything": "goes", "dry_run": True})
+        assert result["dry_run"] is True
+        assert result["anything"] == "goes"
+
     def test_rejects_out_of_range(self):
         with pytest.raises(Exception):
             validate_params("sma_crossover", {"fast": 1000, "slow": 20})

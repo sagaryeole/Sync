@@ -404,6 +404,82 @@ class TestFillManagement:
         assert engine.get_pending_fill_count() == 1
 
 
+class TestRetrySafeFillFlush:
+    """The get/commit/restore trio scheduler._flush_engine_state actually
+    uses. Regression coverage for a real bug: scheduler.py called
+    engine.get_pending_fills() while only drain_pending_fills() existed on
+    PaperEngine, an AttributeError on every single engine_tick/strategy_tick
+    — meaning fills were still applied in-memory but nothing was ever
+    persisted, and no strategy account ever synced to the DB again after it
+    landed. Never caught by the test suite because these tests only drove
+    PaperEngine directly, never through the scheduler's actual call path.
+    """
+
+    def test_get_pending_fills_does_not_clear(self):
+        engine = make_engine(tick_price=50000.0)
+        engine.submit_order(1, "BTC", "BUY", "MARKET", quantity=1.0)
+        first = engine.get_pending_fills()
+        second = engine.get_pending_fills()
+        assert len(first) == 1
+        assert len(second) == 1
+        assert engine.get_pending_fill_count() == 1
+
+    def test_commit_removes_exactly_the_committed_fills(self):
+        engine = make_engine(tick_price=50000.0)
+        engine.submit_order(1, "BTC", "BUY", "MARKET", quantity=1.0)
+        snapshot = engine.get_pending_fills()
+        assert len(snapshot) == 1
+
+        engine.commit_pending_fills(snapshot)
+        assert engine.get_pending_fill_count() == 0
+
+    def test_commit_does_not_remove_fills_added_after_the_snapshot(self):
+        """The scenario get/commit/restore exists for: a second scheduler
+        job thread appends a new fill between the snapshot and the commit —
+        that fill must survive.
+        """
+        engine = make_engine(tick_price=50000.0, cash=1_000_000.0)
+        engine.submit_order(1, "BTC", "BUY", "MARKET", quantity=0.1)
+        snapshot = engine.get_pending_fills()
+
+        # Simulate a concurrent fill landing before the commit call — a
+        # second small BUY on the same (only priced) symbol in this fixture.
+        engine.submit_order(1, "BTC", "BUY", "MARKET", quantity=0.2)
+        assert engine.get_pending_fill_count() == 2
+
+        engine.commit_pending_fills(snapshot)
+        remaining = engine.get_pending_fills()
+        assert len(remaining) == 1
+        assert remaining[0].quantity == pytest.approx(0.2)
+
+    def test_restore_is_a_true_no_op_since_nothing_was_removed(self):
+        """get_pending_fills() never clears, so a failed DB write has
+        nothing to restore — the fill must simply still be there, once,
+        not duplicated by a restore call.
+        """
+        engine = make_engine(tick_price=50000.0)
+        engine.submit_order(1, "BTC", "BUY", "MARKET", quantity=1.0)
+        snapshot = engine.get_pending_fills()
+
+        engine.restore_pending_fills(snapshot)
+        assert engine.get_pending_fill_count() == 1  # not 2
+
+    def test_full_flush_engine_state_cycle_matches_scheduler_usage(self, monkeypatch):
+        """Exercises the exact call sequence scheduler._flush_engine_state
+        uses, end to end, so a rename/signature drift like the one that
+        caused the real bug fails a test instead of only failing silently
+        on a live server."""
+        import scheduler as sched
+
+        engine = make_engine(tick_price=50000.0)  # already registers strategy 1
+        engine.submit_order(1, "BTC", "BUY", "MARKET", quantity=1.0)
+        assert engine.get_pending_fill_count() == 1
+
+        sched._flush_engine_state(engine, market=None)
+
+        assert engine.get_pending_fill_count() == 0
+
+
 class TestStatus:
     def test_get_status(self):
         engine = make_engine()

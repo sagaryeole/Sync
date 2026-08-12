@@ -21,11 +21,13 @@ transaction owned by this module (H5: fill + position/cash update together).
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from database import get_session
+from engine import events
 from engine.logging import set_correlation_id
 from engine.core import PaperEngine
 from engine.market_state import MarketState
@@ -106,13 +108,20 @@ def _strategy_configs() -> list:
 # Persistence helpers (H5: fill + derived-cache update in one transaction)
 # ---------------------------------------------------------------------------
 
-def _persist_fills(session, fills) -> None:
+def _persist_fills(session, fills) -> list:
     """Persist Order + Fill rows for a batch of engine fills, one transaction (H5).
 
     ``f.realized_pnl`` comes from the broker (computed against the pre-fill
     avg entry price before ``apply_fill`` mutates it) — 0.0 for every BUY,
     the realized amount for a SELL.
+
+    Returns one dict per fill with the assigned DB ids and liquidity, so the
+    caller can emit WS ``order``/``fill`` events *after* the commit succeeds
+    — a fill is never announced over WS before it's durable (H5's rule
+    extended to events: an event describing state the DB doesn't have yet
+    is worse than no event at all).
     """
+    persisted = []
     for f in fills:
         liquidity = "MAKER" if f.order_type == "LIMIT" else "TAKER"
         order_row = OrderModel(
@@ -130,7 +139,7 @@ def _persist_fills(session, fills) -> None:
         )
         session.add(order_row)
         session.flush()  # assign order_row.id
-        session.add(FillModel(
+        fill_row = FillModel(
             order_id=order_row.id,
             strategy_id=f.strategy_id,
             symbol=f.symbol,
@@ -142,7 +151,16 @@ def _persist_fills(session, fills) -> None:
             mark_price=f.price,
             liquidity=liquidity,
             ts=f.ts,
-        ))
+        )
+        session.add(fill_row)
+        session.flush()  # assign fill_row.id
+        persisted.append({
+            "fill": f,
+            "order_id": order_row.id,
+            "fill_id": fill_row.id,
+            "liquidity": liquidity,
+        })
+    return persisted
 
 
 def _persist_signals(session, results) -> None:
@@ -217,15 +235,109 @@ def _sync_account(session, account) -> None:
         session.execute(pstmt)
 
 
-def _flush_engine_state(engine: PaperEngine) -> None:
-    """Drain pending fills and sync the portfolio/position cache in one transaction."""
-    fills = engine.drain_pending_fills()
-    if not fills:
+def _emit_fill_events(engine: PaperEngine, market: Optional[MarketState], persisted: list) -> None:
+    """Emit WS order/fill/position events for a batch of just-committed fills.
+
+    Only called after the DB transaction in _flush_engine_state has actually
+    committed — a fill (or the position it produced) is never announced over
+    WS before it's durable, same rule H5 applies to the DB state itself.
+    """
+    marks = market.snapshot() if market is not None else {}
+    touched_positions = set()  # (strategy_id, symbol)
+
+    for p in persisted:
+        f = p["fill"]
+        account = engine.get_account(f.strategy_id)
+        strategy_key = account.strategy_key if account is not None else str(f.strategy_id)
+
+        events.emit("orders", "order", {
+            "id": p["order_id"],
+            "client_order_id": f.client_order_id,
+            "strategy": strategy_key,
+            "symbol": f.symbol,
+            "side": f.side,
+            "order_type": f.order_type,
+            "quantity": f.quantity,
+            "status": "FILLED",
+            "avg_fill_price": f.price,
+        })
+
+        fill_data = {
+            "id": p["fill_id"],
+            "order_id": p["order_id"],
+            "strategy": strategy_key,
+            "symbol": f.symbol,
+            "side": f.side,
+            "quantity": f.quantity,
+            "price": f.price,
+            "fee": f.fee,
+            "realized_pnl": f.realized_pnl,
+            "liquidity": p["liquidity"],
+        }
+        # Aggregate feed (topic "fills") and a per-strategy feed (topic
+        # "fills:{key}") both exist per the WS protocol grammar — publish to
+        # both so a client can subscribe at either granularity.
+        events.emit("fills", "fill", fill_data)
+        events.emit("fills:%s" % strategy_key, "fill", fill_data)
+
+        touched_positions.add((f.strategy_id, f.symbol))
+
+    for strategy_id, symbol in touched_positions:
+        account = engine.get_account(strategy_id)
+        if account is None:
+            continue
+        pos = account.get_position(symbol)
+        if pos is None:
+            continue
+        mark = marks.get(symbol) or 0.0
+        events.emit("positions:%s" % account.strategy_key, "position", {
+            "strategy": account.strategy_key,
+            "symbol": symbol,
+            "quantity": pos.quantity,
+            "avg_entry_price": pos.avg_entry_price,
+            "mark_price": mark,
+            "market_value": pos.market_value(mark),
+            "unrealized_pnl": pos.unrealized_pnl(mark),
+            "unrealized_pnl_pct": pos.unrealized_pnl_pct(mark),
+            "stop_loss_price": pos.stop_loss_price,
+            "take_profit_price": pos.take_profit_price,
+        })
+
+
+def _emit_halt_events(engine: PaperEngine, halted_ids: list) -> None:
+    """Emit a "halt" event (never dropped, see NON_DROPPABLE_TYPES) per
+    strategy the kill-switch just tripped, once its halted state is durable.
+    """
+    for strategy_id in halted_ids:
+        account = engine.get_account(strategy_id)
+        if account is None:
+            continue
+        events.emit("system", "halt", {
+            "strategy_id": strategy_id,
+            "strategy": account.strategy_key,
+            "reason": account.halt_reason,
+        })
+
+
+def _flush_engine_state(engine: PaperEngine, market: Optional[MarketState] = None) -> None:
+    """Drain pending fills + halts, sync the portfolio/position cache in one
+    transaction (H5), then emit the corresponding WS events — only once that
+    transaction has actually committed.
+
+    If the DB commit fails, fills are restored to the engine for retry on the
+    next tick so no fill is ever lost.
+    """
+    fills = engine.get_pending_fills()
+    halted_ids = engine.drain_pending_halts()
+    if not fills and not halted_ids:
         return
+
     session = get_session()
+    persisted = []
     try:
-        _persist_fills(session, fills)
-        touched = {f.strategy_id for f in fills}
+        if fills:
+            persisted = _persist_fills(session, fills)
+        touched = {f.strategy_id for f in fills} | set(halted_ids)
         for strategy_id in touched:
             account = engine.get_account(strategy_id)
             if account is not None:
@@ -233,24 +345,50 @@ def _flush_engine_state(engine: PaperEngine) -> None:
         session.commit()
     except Exception:
         session.rollback()
-        logger.exception("Failed to flush engine fills/positions to DB")
+        logger.exception("Failed to flush engine fills/positions to DB — restoring fills for retry")
+        engine.restore_pending_fills(fills)
+        return
     finally:
         session.close()
+
+    # Reached only after a successful commit.
+    engine.commit_pending_fills(fills)
+    if persisted:
+        _emit_fill_events(engine, market, persisted)
+    if halted_ids:
+        _emit_halt_events(engine, halted_ids)
 
 
 # ---------------------------------------------------------------------------
 # Jobs
 # ---------------------------------------------------------------------------
 
-def _make_engine_tick_job(engine: PaperEngine):
+def _make_engine_tick_job(engine: PaperEngine, market: MarketState):
     def job():
         with set_correlation_id():
             try:
                 engine.on_tick_batch()
-                _flush_engine_state(engine)
+                _flush_engine_state(engine, market)
             except Exception:
                 logger.exception("engine_tick job failed")
     return job
+
+
+def _emit_signal_events(results) -> None:
+    """Emit a "signal" WS event per non-HOLD decision — after the matching
+    Signal rows have committed (see the strategy_tick job below).
+    """
+    for r in results:
+        if r.decision.action == Action.HOLD:
+            continue
+        events.emit("signals", "signal", {
+            "strategy": r.strategy_key,
+            "symbol": r.symbol,
+            "action": r.decision.action,
+            "strength": r.decision.strength,
+            "price": r.last_price,
+            "indicators": r.decision.indicators or {},
+        })
 
 
 def _make_strategy_tick_job(engine: PaperEngine, market: MarketState, symbols, feed_manager):
@@ -268,15 +406,19 @@ def _make_strategy_tick_job(engine: PaperEngine, market: MarketState, symbols, f
                 results = runner.run_all(configs)
                 if results:
                     session = get_session()
+                    committed = False
                     try:
                         _persist_signals(session, results)
                         session.commit()
+                        committed = True
                     except Exception:
                         session.rollback()
                         logger.exception("Failed to persist signals")
                     finally:
                         session.close()
-                _flush_engine_state(engine)
+                    if committed:
+                        _emit_signal_events(results)
+                _flush_engine_state(engine, market)
             except Exception:
                 logger.exception("strategy_tick job failed")
     return job
@@ -286,26 +428,49 @@ def _make_equity_snapshot_job(engine: PaperEngine, market: MarketState):
     def job():
         with set_correlation_id():
             session = get_session()
+            snapshots = []
             try:
                 marks = market.snapshot()
                 now = datetime.now(timezone.utc)
                 for strategy_id, account in engine.get_all_accounts().items():
+                    equity = account.equity(marks)
                     session.add(EquitySnapshot(
                         strategy_id=strategy_id,
                         ts=now,
-                        equity=account.equity(marks),
+                        equity=equity,
                         cash=account.cash,
                         position_value=account.position_value(marks),
                         realized_pnl=account.realized_pnl,
                         unrealized_pnl=account.unrealized_pnl(marks),
                         drawdown_pct=account.drawdown_pct(marks),
                     ))
+                    # H10: guard against starting_cash == 0
+                    return_pct = (
+                        (equity - account.starting_cash) / account.starting_cash
+                        if account.starting_cash > 0 else 0.0
+                    )
+                    snapshots.append({
+                        "strategy": account.strategy_key,
+                        "ts": int(now.timestamp()),
+                        "equity": equity,
+                        "cash": account.cash,
+                        "position_value": account.position_value(marks),
+                        "realized_pnl": account.realized_pnl,
+                        "unrealized_pnl": account.unrealized_pnl(marks),
+                        "drawdown_pct": account.drawdown_pct(marks),
+                        "return_pct": return_pct,
+                    })
                 session.commit()
             except Exception:
                 session.rollback()
                 logger.exception("equity_snapshot job failed")
+                return
             finally:
                 session.close()
+
+            # Reached only after a successful commit.
+            if snapshots:
+                events.emit("equity", "equity", {"snapshots": snapshots})
     return job
 
 
@@ -344,7 +509,7 @@ def start_scheduler(engine: PaperEngine, market: MarketState, symbols, feed_mana
     scheduler = BackgroundScheduler()
 
     scheduler.add_job(
-        _make_engine_tick_job(engine),
+        _make_engine_tick_job(engine, market),
         "interval",
         seconds=settings.engine_tick_seconds,
         id="engine_tick",

@@ -91,6 +91,10 @@ class PaperEngine:
         # List of fills produced since last flush (for DB persistence)
         self._pending_fills: List[Fill] = []
 
+        # strategy_ids halted since last flush (WS: emit "halt" only after the
+        # halt + flatten fills are durably persisted, same rule as fills)
+        self._pending_halts: List[int] = []
+
         # List of closed positions (for cooldown tracking)
         self._recent_closes: List[Tuple[int, str, datetime]] = []
 
@@ -133,6 +137,7 @@ class PaperEngine:
         stop_price: Optional[float] = None,
         client_order_id: Optional[str] = None,
         attach_stops: bool = False,
+        size_scale: float = 1.0,
     ) -> Tuple[Optional[Fill], Optional[str]]:
         """Submit an order to the engine. This is THE method for placing trades.
 
@@ -187,7 +192,7 @@ class PaperEngine:
                 if last is None:
                     return None, RejectReason.NO_MARKET_DATA.value
                 quantity, sl_price, tp_price, reason = self.risk.size_order(
-                    account, symbol, last, marks
+                    account, symbol, last, marks, size_scale=size_scale
                 )
                 if reason is not None:
                     return None, reason
@@ -225,19 +230,17 @@ class PaperEngine:
                     return None, order.reject_reason.value if order.reject_reason else "UNKNOWN"
 
             elif type_enum == OrderType.LIMIT:
-                # Try immediate fill first
                 fill = self.broker.check_limit_fill(order, account)
                 if fill is not None:
                     self._pending_fills.append(fill)
                     if attach_stops and side_enum == OrderSide.BUY:
-                        pos = account.get_position(symbol)
+                        pos = account.get_position(order.symbol)
                         if pos is not None:
                             self.risk.attach_stops(pos, fill.price)
                     return fill, None
-                # Not filled — add to working orders
+                if order.reject_reason is not None:
+                    return None, order.reject_reason.value
                 self._working_orders[client_order_id] = order
-                logger.info("LIMIT order %s working for %s %s %s @ %.2f",
-                           client_order_id, side_enum.value, quantity, symbol, limit_price or 0)
                 return None, None  # working, not rejected
 
             elif type_enum == OrderType.STOP:
@@ -304,11 +307,12 @@ class PaperEngine:
                     fills.append(fill)
                     self._pending_fills.append(fill)
                     filled_limit_ids.append(client_id)
-                    # Attach stops if this was a BUY with stops
                     if order.side == OrderSide.BUY:
                         pos = account.get_position(order.symbol)
                         if pos is not None and pos.stop_loss_price is None:
                             self.risk.attach_stops(pos, fill.price)
+                elif order.reject_reason is not None:
+                    filled_limit_ids.append(client_id)
 
             for cid in filled_limit_ids:
                 self._working_orders.pop(cid, None)
@@ -364,7 +368,8 @@ class PaperEngine:
                         fills.append(fill)
                         self._pending_fills.append(fill)
                         self.risk.start_cooldown(strategy_id, symbol)
-                    continue  # position is closed, skip TP check
+                        continue  # position is closed, skip TP check
+                    # If close was rejected (e.g. stale price), fall through to TP check
 
                 # Check TP
                 if pos.take_profit_price is not None and last >= pos.take_profit_price - _EPS:
@@ -414,30 +419,84 @@ class PaperEngine:
         """Halt a strategy and flatten all positions.
 
         Flatten first, then halt — the broker rejects orders from halted strategies.
+        If some positions fail to close, they remain open but the strategy is still
+        halted; an error is logged for each failure.
         """
         logger.warning("Kill-switch triggered for %s — flattening all positions",
                       account.strategy_key)
+        failures = []
         for symbol, pos in list(account.positions.items()):
             if pos.is_open:
                 fill = self._close_position(account, pos, "KILL_SWITCH")
                 if fill is not None:
                     self._pending_fills.append(fill)
+                else:
+                    failures.append(symbol)
         # Halt after flattening so the broker doesn't reject the sell orders
         account.halt("MAX_DRAWDOWN")
+        self._pending_halts.append(account.strategy_id)
+        if failures:
+            logger.error("Kill-switch partial failure for %s: failed to close %s",
+                        account.strategy_key, failures)
 
     # --- Fill management (for DB persistence) ---
 
     def drain_pending_fills(self) -> List[Fill]:
-        """Get and clear pending fills for DB persistence."""
+        """Get and clear pending fills for DB persistence.
+
+        Unlike get_pending_fills()/commit_pending_fills(), this clears
+        unconditionally at read time — a caller that drains, then fails to
+        persist, loses the fills. Kept for existing callers/tests; new code
+        that persists to a DB should use the get/commit/restore trio below
+        so a failed transaction never drops a fill (see scheduler.py's
+        _flush_engine_state, which is exactly the caller this matters for).
+        """
         with self._lock:
             fills = list(self._pending_fills)
             self._pending_fills.clear()
             return fills
 
+    def get_pending_fills(self) -> List[Fill]:
+        """Snapshot pending fills WITHOUT clearing them.
+
+        Pairs with commit_pending_fills() (remove after a successful DB
+        write) and restore_pending_fills() (no-op by construction here,
+        since nothing was removed — the fills are simply still pending,
+        ready for the next tick's retry). Fills appended concurrently by
+        another scheduler job thread between this snapshot and the matching
+        commit/restore call are untouched either way, since both operate by
+        object identity, not by clearing the whole list.
+        """
+        with self._lock:
+            return list(self._pending_fills)
+
+    def commit_pending_fills(self, fills: List[Fill]) -> None:
+        """Remove specific fills from the pending list after successful persistence."""
+        with self._lock:
+            fill_ids = {id(f) for f in fills}
+            self._pending_fills = [f for f in self._pending_fills if id(f) not in fill_ids]
+
+    def restore_pending_fills(self, fills: List[Fill]) -> None:
+        """Return fills to the pending list after a failed DB flush."""
+        with self._lock:
+            existing_ids = {id(f) for f in self._pending_fills}
+            for f in fills:
+                if id(f) not in existing_ids:
+                    self._pending_fills.append(f)
+
     def get_pending_fill_count(self) -> int:
         """Get count of pending fills (for monitoring)."""
         with self._lock:
             return len(self._pending_fills)
+
+    def drain_pending_halts(self) -> List[int]:
+        """Get and clear strategy_ids halted since the last flush (WS: emit
+        "halt" only once the halt + flatten fills are durably persisted).
+        """
+        with self._lock:
+            halts = list(self._pending_halts)
+            self._pending_halts.clear()
+            return halts
 
     # --- Status / inspection ---
 
@@ -471,13 +530,14 @@ class PaperEngine:
             before_ts: if provided, only replay fills with ts < before_ts
 
         Returns:
-            {strategy_id: {"cash": float, "positions": {symbol: qty}, "diverged": bool}}
+            {strategy_id: {"cash": float, "positions": {symbol: qty}, "realized_pnl": float, "fees": float}}
         """
         rebuilt = {}
         with self._lock:
             for strategy_id, account in self._accounts.items():
                 cash = float(account.starting_cash)
                 positions: Dict[str, float] = {}
+                avg_prices: Dict[str, float] = {}
                 realized_pnl = 0.0
                 fees = 0.0
 
@@ -485,18 +545,30 @@ class PaperEngine:
                     if before_ts is not None and f.ts >= before_ts:
                         break
                     fees += float(f.fee)
+                    qty = float(f.quantity)
+                    price = float(f.price)
+                    fee = float(f.fee)
                     if f.side == "BUY":
-                        cash -= float(f.quantity) * float(f.price) + float(f.fee)
-                        positions[f.symbol] = positions.get(f.symbol, 0.0) + float(f.quantity)
+                        cash -= qty * price + fee
+                        old_qty = positions.get(f.symbol, 0.0)
+                        old_avg = avg_prices.get(f.symbol, 0.0)
+                        new_qty = old_qty + qty
+                        if new_qty > _EPS:
+                            avg_prices[f.symbol] = (old_qty * old_avg + qty * price + fee) / new_qty
+                        positions[f.symbol] = new_qty
                     else:
-                        qty = float(f.quantity)
-                        cash += qty * float(f.price) - float(f.fee)
-                        positions[f.symbol] = positions.get(f.symbol, 0.0) - qty
+                        cash += qty * price - fee
+                        old_qty = positions.get(f.symbol, 0.0)
+                        old_avg = avg_prices.get(f.symbol, 0.0)
+                        if old_qty > _EPS:
+                            realized_pnl += qty * (price - old_avg) - fee
+                        positions[f.symbol] = old_qty - qty
 
                 # Round positions to 0 if tiny
                 for sym in list(positions.keys()):
                     if abs(positions[sym]) < 1e-9:
                         del positions[sym]
+                        avg_prices.pop(sym, None)
 
                 rebuilt[strategy_id] = {
                     "cash": cash,

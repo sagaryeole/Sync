@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 import config
 from database import get_session
-from models import Asset, PriceTicker
+from models import Asset, PriceTicker, Candle
 from pydantic import BaseModel, Field, field_validator
 from feeds.symbols import SYMBOLS
 
@@ -29,6 +29,19 @@ class PriceTickerResponse(BaseModel):
     symbol: str
     price: float
     timestamp: str
+
+
+class CandleResponse(BaseModel):
+    symbol: str
+    interval: str
+    open_time: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    trades: int
+    source: str
 
 
 # ---------------------------------------------------------------------------
@@ -74,4 +87,36 @@ def list_prices(
             timestamp=p.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
         for p in data
+    ]
+
+
+@router.get("/candles", response_model=List[CandleResponse])
+def list_candles(
+    symbol: str,
+    interval: str = "1m",
+    limit: int = 100,
+    db: Session = Depends(get_session),
+):
+    rows = (
+        db.query(Candle)
+        .filter_by(symbol=symbol, interval=interval)
+        .order_by(Candle.open_time.desc())
+        .limit(min(limit, 1000))
+        .all()
+    )
+    rows.reverse()
+    return [
+        CandleResponse(
+            symbol=r.symbol,
+            interval=r.interval,
+            open_time=int(r.open_time.timestamp()),
+            open=float(r.open),
+            high=float(r.high),
+            low=float(r.low),
+            close=float(r.close),
+            volume=float(r.volume),
+            trades=r.trades or 0,
+            source=r.source or "",
+        )
+        for r in rows
     ]

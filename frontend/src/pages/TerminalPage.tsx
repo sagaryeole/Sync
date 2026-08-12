@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useMemo } from 'react';
 import { useStore } from '../store';
 import { useMarketStore } from '../store/marketSlice';
 import { usePortfolioStore } from '../store/portfolioSlice';
@@ -7,67 +7,153 @@ import TopBar from '../components/layout/TopBar';
 import NavTabs from '../components/layout/NavTabs';
 import TickerStrip from '../components/layout/TickerStrip';
 import CandleChart from '../components/market/CandleChart';
+import ConnectionPill from '../components/layout/ConnectionPill';
+import Panel from '../components/common/Panel';
 import { Candle } from '../types/market';
-import { PortfolioItem } from '../store/portfolioSlice';
+import { useWebSocket } from '../hooks/useWebSocket';
+import { fmtUsd, fmtQty, fmtTime, signClass } from '../lib/format';
 
 const TABS = [
   { label: 'Terminal', href: '/' },
   { label: 'Strategies', href: '/strategies' },
   { label: 'Orders', href: '/orders' },
+  { label: 'Journal', href: '/journal' },
   { label: 'Settings', href: '/settings' },
 ];
 
+const SYMBOLS = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'DOGE', 'AVAX', 'LINK'];
+const CHART_SYMBOL = 'BTC';
+
+const TH = 'px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-slate-400';
+const TD = 'px-3 py-2 text-sm';
+
 export default function TerminalPage() {
-  const { fetchAll, loading } = useStore();
-  const { latestPrices } = useMarketStore();
+  const { fetchAll, loading, strategies, strategyId, setStrategyId } = useStore();
+  const { latestPrices, fetchPrices } = useMarketStore();
+  const { fetchPortfolio } = usePortfolioStore();
+  const [selectedCandles, setSelectedCandles] = useState<Candle[]>([]);
+  const [selectedSymbol, setSelectedSymbol] = useState(CHART_SYMBOL);
 
   useEffect(() => {
     fetchAll();
   }, [fetchAll]);
 
-  const tickers = Object.entries(latestPrices).map(([sym, price]) => ({
-    symbol: sym,
-    price,
-  }));
+  useEffect(() => {
+    if (strategyId) fetchPortfolio(strategyId);
+    const interval = setInterval(() => {
+      if (strategyId) fetchPortfolio(strategyId);
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [strategyId, fetchPortfolio]);
 
-  const selectedCandles: Candle[] = [];
+  useEffect(() => {
+    const interval = setInterval(fetchPrices, 5000);
+    return () => clearInterval(interval);
+  }, [fetchPrices]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadCandles() {
+      try {
+        const res = await fetch(
+          `/api/candles?symbol=${encodeURIComponent(selectedSymbol)}&interval=1m&limit=200`,
+        );
+        if (!cancelled && res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data)) setSelectedCandles(data);
+        }
+      } catch {
+        // Chart history is non-critical; the live WS candle stream still updates.
+      }
+    }
+    loadCandles();
+    const interval = setInterval(loadCandles, 10000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [selectedSymbol]);
+
+  const tickers = useMemo(
+    () => Object.entries(latestPrices).map(([symbol, price]) => ({ symbol, price })),
+    [latestPrices],
+  );
+
+  // Feed status is handled centrally in useWebSocket -> marketSlice, so both
+  // this page and TopBar render the same value instead of disagreeing.
+  const wsTopics = useMemo(() => {
+    const topics = ['ticks', 'feed'];
+    if (selectedSymbol) topics.push(`candles:${selectedSymbol}:1m`);
+    return topics;
+  }, [selectedSymbol]);
+
+  useWebSocket(wsTopics);
 
   return (
     <AppShell>
       <TopBar />
       <NavTabs tabs={TABS} active="/" />
       <TickerStrip tickers={tickers} />
-      <main style={{
-        display: 'grid',
-        gridTemplateColumns: 'repeat(12, 1fr)',
-        gap: '1rem',
-        padding: '1.5rem',
-        maxWidth: '1600px',
-        margin: '0 auto',
-      }}>
-        <section style={{ gridColumn: 'span 12', display: 'grid', gridTemplateColumns: 'repeat(12, 1fr)', gap: '1rem' }}>
-          <div style={{ gridColumn: 'span 4' }}>
-            <PricePanel />
+
+      <main className="mx-auto w-full max-w-[1600px] p-6">
+        {/* Controls */}
+        <div className="mb-4 flex flex-wrap items-center gap-4">
+          <div className="flex flex-wrap gap-1.5">
+            {SYMBOLS.map((sym) => (
+              <button
+                key={sym}
+                onClick={() => setSelectedSymbol(sym)}
+                aria-pressed={selectedSymbol === sym}
+                className={`rounded px-3 py-1 text-sm transition-colors ${
+                  selectedSymbol === sym
+                    ? 'bg-sky-400 font-semibold text-slate-950'
+                    : 'bg-slate-950 text-slate-300 hover:bg-slate-800'
+                }`}
+              >
+                {sym}
+              </button>
+            ))}
           </div>
-          <div style={{ gridColumn: 'span 4' }}>
-            <PortfolioPanel />
+
+          {strategies.length > 0 && (
+            <label className="flex items-center gap-2 text-sm text-slate-400">
+              Strategy:
+              <select
+                value={strategyId || ''}
+                onChange={(e) => setStrategyId(Number(e.target.value))}
+                className="rounded border border-slate-700 bg-slate-950 px-2 py-1 text-sm text-slate-200 focus:border-slate-500 focus:outline-none"
+              >
+                {strategies.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name} ({s.key})
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+
+          <div className="ml-auto">
+            <ConnectionPill />
           </div>
-          <div style={{ gridColumn: 'span 4' }}>
-            <TradePanel />
-          </div>
-        </section>
-        <section style={{ gridColumn: 'span 12' }}>
-          <CandleChart candles={selectedCandles} />
-        </section>
+        </div>
+
+        {/* Row 1 */}
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
+          <PricePanel className="lg:col-span-4" />
+          <PortfolioPanel strategyId={strategyId} className="lg:col-span-5" />
+          <TradePanel strategyId={strategyId} className="lg:col-span-3" />
+        </div>
+
+        {/* Row 2 — chart */}
+        <div className="mt-4">
+          <Panel title={`${selectedSymbol} · 1m`}>
+            <CandleChart candles={selectedCandles} />
+          </Panel>
+        </div>
       </main>
+
       {loading && (
-        <div style={{
-          position: 'fixed',
-          bottom: '1rem',
-          right: '1rem',
-          color: '#94a3b8',
-          fontSize: '0.875rem',
-        }}>
+        <div className="fixed bottom-4 right-4 rounded-md border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm text-slate-400 shadow-lg">
           Loading…
         </div>
       )}
@@ -75,113 +161,149 @@ export default function TerminalPage() {
   );
 }
 
-function PricePanel() {
-  const { prices, fetchPrices } = useMarketStore();
+function PricePanel({ className = '' }: { className?: string }) {
+  const { prices } = useMarketStore();
   const [filter, setFilter] = useState<string>('ALL');
 
-  useEffect(() => {
-    fetchPrices();
-    const interval = setInterval(fetchPrices, 5000);
-    return () => clearInterval(interval);
-  }, [fetchPrices]);
-
-  const filtered = filter === 'ALL' ? prices : prices.filter(p => p.symbol === filter);
+  const filtered = filter === 'ALL' ? prices : prices.filter((p) => p.symbol === filter);
 
   return (
-    <div style={{ background: '#1e293b', borderRadius: '8px', overflow: 'auto' }}>
-      <div style={{ display: 'flex', gap: '0.5rem', padding: '0.75rem', borderBottom: '1px solid #334155' }}>
-        {['ALL', 'BTC', 'ETH', 'SOL'].map(f => (
-          <button key={f} onClick={() => setFilter(f)} style={{
-            background: filter === f ? '#38bdf8' : '#0f172a',
-            color: filter === f ? '#0f172a' : '#cbd5e1',
-            padding: '0.25rem 0.75rem',
-            borderRadius: '4px',
-            border: 'none',
-            fontSize: '0.875rem',
-            cursor: 'pointer',
-          }}>{f}</button>
-        ))}
-      </div>
-      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-        <thead><tr style={{ background: '#2d3748' }}>
-          <th style={{ padding: '0.75rem', textAlign: 'left' }}>Symbol</th>
-          <th style={{ padding: '0.75rem', textAlign: 'right' }}>Price</th>
-          <th style={{ padding: '0.75rem', textAlign: 'right' }}>Time</th>
-        </tr></thead>
+    <Panel
+      title="Prices"
+      className={className}
+      flush
+      actions={
+        <div className="flex gap-1">
+          {['ALL', 'BTC', 'ETH', 'SOL'].map((f) => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              aria-pressed={filter === f}
+              className={`rounded px-2 py-0.5 text-xs transition-colors ${
+                filter === f
+                  ? 'bg-sky-400 font-semibold text-slate-950'
+                  : 'bg-slate-950 text-slate-400 hover:bg-slate-800'
+              }`}
+            >
+              {f}
+            </button>
+          ))}
+        </div>
+      }
+    >
+      <table className="w-full border-collapse">
+        <thead className="sticky top-0 bg-slate-800/80 backdrop-blur">
+          <tr>
+            <th className={TH}>Symbol</th>
+            <th className={`${TH} text-right`}>Price</th>
+            <th className={`${TH} text-right`}>Time</th>
+          </tr>
+        </thead>
         <tbody>
-          {filtered.map(p => (
-            <tr key={p.id} style={{ borderBottom: '1px solid #334155' }}>
-              <td style={{ padding: '0.75rem' }}>{p.symbol}</td>
-              <td style={{ padding: '0.75rem', textAlign: 'right' }}>${p.price.toFixed(2)}</td>
-              <td style={{ padding: '0.75rem', textAlign: 'right' }}>{new Date(p.timestamp).toLocaleTimeString()}</td>
+          {filtered.map((p) => (
+            <tr key={p.id} className="border-b border-slate-800/60 last:border-0">
+              <td className={`${TD} font-medium text-slate-200`}>{p.symbol}</td>
+              <td className={`${TD} text-right tabular-nums`}>{fmtUsd(p.price)}</td>
+              <td className={`${TD} text-right text-slate-500`}>{fmtTime(p.timestamp)}</td>
             </tr>
           ))}
           {filtered.length === 0 && (
-            <tr><td colSpan={3} style={{ padding: '1rem', textAlign: 'center', color: '#64748b' }}>No price data</td></tr>
+            <tr>
+              <td colSpan={3} className="px-3 py-8 text-center text-sm text-slate-500">
+                No price data
+              </td>
+            </tr>
           )}
         </tbody>
       </table>
-    </div>
+    </Panel>
   );
 }
 
-function PortfolioPanel() {
-  const { portfolio, fetchPortfolio } = usePortfolioStore();
+function PortfolioPanel({
+  strategyId,
+  className = '',
+}: {
+  strategyId: number | null;
+  className?: string;
+}) {
+  const { positions, account, fetchPortfolio } = usePortfolioStore();
 
   useEffect(() => {
-    fetchPortfolio();
-    const interval = setInterval(fetchPortfolio, 5000);
-    return () => clearInterval(interval);
-  }, [fetchPortfolio]);
+    if (strategyId) fetchPortfolio(strategyId);
+  }, [strategyId, fetchPortfolio]);
 
-  const positions = portfolio.filter((p: PortfolioItem) => Number(p.balance) > 0 || Number(p.quantity) > 0);
-  const totalUSD = positions.find((p: PortfolioItem) => p.symbol === 'USD');
-  const totalCoins = positions.filter((p: PortfolioItem) => p.symbol !== 'USD');
+  const openPositions = positions.filter((p) => Number(p.quantity) > 0);
 
   return (
-    <div style={{ background: '#1e293b', borderRadius: '8px', overflow: 'auto' }}>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '1rem', padding: '0.75rem', borderBottom: '1px solid #334155' }}>
+    <Panel title="Portfolio" className={className} flush>
+      <div className="grid grid-cols-2 gap-4 border-b border-slate-800 p-4">
         <div>
-          <div style={{ color: '#94a3b8', fontSize: '0.875rem' }}>Cash (USD)</div>
-          <div style={{ fontSize: '1.25rem', fontWeight: 'bold', color: '#fbbf24' }}>
-            ${totalUSD?.balance.toFixed(2) || '0.00'}
+          <div className="text-xs uppercase tracking-wide text-slate-400">Cash (USD)</div>
+          <div className="text-xl font-bold tabular-nums text-amber-400">
+            {fmtUsd(account?.cash)}
+          </div>
+          <div className={`mt-0.5 text-xs tabular-nums ${signClass(account?.realized_pnl)}`}>
+            Realised P&amp;L: {fmtUsd(account?.realized_pnl)}
           </div>
         </div>
         <div>
-          <div style={{ color: '#94a3b8', fontSize: '0.875rem' }}>Assets</div>
-          {totalCoins.map((p: PortfolioItem) => (
-            <div key={p.symbol} style={{ fontSize: '0.875rem' }}>
-              {p.symbol}: {p.quantity.toFixed(4)}
+          <div className="text-xs uppercase tracking-wide text-slate-400">Open Positions</div>
+          <div className="text-xl font-bold tabular-nums text-slate-100">
+            {openPositions.length}
+          </div>
+          {account?.is_halted && (
+            <div className="mt-0.5 text-xs text-rose-400">
+              HALTED{account.halt_reason ? ` · ${account.halt_reason}` : ''}
             </div>
-          ))}
+          )}
         </div>
       </div>
-      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-        <thead><tr style={{ background: '#2d3748' }}>
-          <th style={{ padding: '0.75rem', textAlign: 'left' }}>Symbol</th>
-          <th style={{ padding: '0.75rem', textAlign: 'right' }}>Balance</th>
-          <th style={{ padding: '0.75rem', textAlign: 'right' }}>Quantity</th>
-          <th style={{ padding: '0.75rem', textAlign: 'right' }}>Cost Basis</th>
-        </tr></thead>
+
+      <table className="w-full border-collapse">
+        <thead className="bg-slate-800/50">
+          <tr>
+            <th className={TH}>Symbol</th>
+            <th className={`${TH} text-right`}>Qty</th>
+            <th className={`${TH} text-right`}>Avg Entry</th>
+            <th className={`${TH} text-right`}>SL</th>
+            <th className={`${TH} text-right`}>TP</th>
+          </tr>
+        </thead>
         <tbody>
-          {positions.map((p: PortfolioItem) => (
-            <tr key={p.symbol} style={{ borderBottom: '1px solid #334155' }}>
-              <td style={{ padding: '0.75rem' }}>{p.symbol}</td>
-              <td style={{ padding: '0.75rem', textAlign: 'right' }}>${p.balance.toFixed(2)}</td>
-              <td style={{ padding: '0.75rem', textAlign: 'right' }}>{p.quantity.toFixed(4)}</td>
-              <td style={{ padding: '0.75rem', textAlign: 'right' }}>${p.cost_basis.toFixed(2)}</td>
+          {openPositions.map((p) => (
+            <tr key={p.symbol} className="border-b border-slate-800/60 last:border-0">
+              <td className={`${TD} font-medium text-slate-200`}>{p.symbol}</td>
+              <td className={`${TD} text-right tabular-nums`}>{fmtQty(p.quantity, 4)}</td>
+              <td className={`${TD} text-right tabular-nums`}>{fmtUsd(p.avg_entry_price)}</td>
+              <td className={`${TD} text-right tabular-nums text-rose-400/80`}>
+                {fmtUsd(p.stop_loss_price)}
+              </td>
+              <td className={`${TD} text-right tabular-nums text-emerald-400/80`}>
+                {fmtUsd(p.take_profit_price)}
+              </td>
             </tr>
           ))}
-          {positions.length === 0 && (
-            <tr><td colSpan={4} style={{ padding: '1rem', textAlign: 'center', color: '#64748b' }}>No positions</td></tr>
+          {openPositions.length === 0 && (
+            <tr>
+              <td colSpan={5} className="px-3 py-8 text-center text-sm text-slate-500">
+                No open positions
+              </td>
+            </tr>
           )}
         </tbody>
       </table>
-    </div>
+    </Panel>
   );
 }
 
-function TradePanel() {
+function TradePanel({
+  strategyId,
+  className = '',
+}: {
+  strategyId: number | null;
+  className?: string;
+}) {
   const { executeTrade, loading, error, clearError } = useStore();
   const [symbol, setSymbol] = useState('BTC');
   const [type, setType] = useState<'BUY' | 'SELL'>('BUY');
@@ -189,19 +311,25 @@ function TradePanel() {
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<string | null>(null);
 
+  const disabled = submitting || loading || !strategyId;
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const qty = Number(quantity);
-    if (!qty || qty <= 0) {
-      setResult('Please enter a valid quantity');
+    if (!Number.isFinite(qty) || qty <= 0) {
+      setResult('Enter a valid quantity');
+      return;
+    }
+    if (!strategyId) {
+      setResult('No strategy selected');
       return;
     }
     setSubmitting(true);
     setResult(null);
-    const res = await executeTrade(type, symbol, qty);
+    const res = await executeTrade(type, symbol, qty, strategyId);
     setSubmitting(false);
     if (res) {
-      setResult(`${res.type} ${res.quantity} ${res.symbol} @ $${res.price.toFixed(2)}`);
+      setResult(`${res.type} ${fmtQty(res.quantity, 4)} ${res.symbol} @ ${fmtUsd(res.price)}`);
       setQuantity('');
     } else {
       setResult('Trade failed — see error banner');
@@ -209,55 +337,78 @@ function TradePanel() {
   };
 
   return (
-    <div style={{ background: '#1e293b', padding: '1.5rem', borderRadius: '8px' }}>
-      <h3 style={{ margin: '0 0 1rem 0', fontSize: '1rem' }}>Execute Trade</h3>
+    <Panel title="Execute Trade" className={className}>
       {error && (
-        <div style={{ background: '#7f1d1d', color: '#fca5a5', padding: '0.75rem', borderRadius: '8px', marginBottom: '1rem' }}>
-          {error}
-          <button onClick={clearError} style={{ background: 'transparent', border: 'none', color: '#fca5a5', cursor: 'pointer', float: 'right' }}>✕</button>
+        <div className="mb-3 flex items-start justify-between gap-2 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-300">
+          <span>{error}</span>
+          <button onClick={clearError} aria-label="Dismiss error" className="text-rose-300">
+            ✕
+          </button>
         </div>
       )}
       {result && (
-        <div style={{ background: '#14532d', color: '#86efac', padding: '0.75rem', borderRadius: '8px', marginBottom: '1rem' }}>
+        <div className="mb-3 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-300">
           {result}
         </div>
       )}
-      <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-        <label style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-          <span style={{ color: '#94a3b8', fontSize: '0.875rem' }}>Symbol</span>
-          <select value={symbol} onChange={e => setSymbol(e.target.value)} style={{
-            background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155',
-            padding: '0.5rem', borderRadius: '4px',
-          }}>
-            {['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'DOGE', 'AVAX', 'LINK'].map(s => (
-              <option key={s} value={s}>{s}</option>
+
+      <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+        <label className="flex flex-col gap-1.5">
+          <span className="text-xs uppercase tracking-wide text-slate-400">Symbol</span>
+          <select
+            value={symbol}
+            onChange={(e) => setSymbol(e.target.value)}
+            className="rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm text-slate-200 focus:border-slate-500 focus:outline-none"
+          >
+            {SYMBOLS.map((s) => (
+              <option key={s} value={s}>
+                {s}
+              </option>
             ))}
           </select>
         </label>
-        <div style={{ display: 'flex', gap: '0.5rem' }}>
-          {(['BUY', 'SELL'] as const).map(t => (
-            <button key={t} type="button" onClick={() => setType(t)} style={{
-              flex: 1, padding: '0.5rem', borderRadius: '4px', border: 'none',
-              background: type === t ? (t === 'BUY' ? '#16a34a' : '#dc2626') : '#334155',
-              color: type === t ? '#fff' : '#94a3b8', fontWeight: 'bold', cursor: 'pointer',
-            }}>{t}</button>
+
+        <div className="flex gap-2">
+          {(['BUY', 'SELL'] as const).map((t) => (
+            <button
+              key={t}
+              type="button"
+              onClick={() => setType(t)}
+              aria-pressed={type === t}
+              className={`flex-1 rounded py-2 text-sm font-bold transition-colors ${
+                type === t
+                  ? t === 'BUY'
+                    ? 'bg-emerald-600 text-white'
+                    : 'bg-rose-600 text-white'
+                  : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
+              }`}
+            >
+              {t}
+            </button>
           ))}
         </div>
-        <label style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-          <span style={{ color: '#94a3b8', fontSize: '0.875rem' }}>Quantity</span>
-          <input type="number" step="0.0001" min="0" value={quantity} onChange={e => setQuantity(e.target.value)} placeholder="0.00" style={{
-            background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155',
-            padding: '0.5rem', borderRadius: '4px',
-          }} />
+
+        <label className="flex flex-col gap-1.5">
+          <span className="text-xs uppercase tracking-wide text-slate-400">Quantity</span>
+          <input
+            type="number"
+            step="0.0001"
+            min="0"
+            value={quantity}
+            onChange={(e) => setQuantity(e.target.value)}
+            placeholder="0.00"
+            className="rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm tabular-nums text-slate-200 placeholder:text-slate-600 focus:border-slate-500 focus:outline-none"
+          />
         </label>
-        <button type="submit" disabled={submitting || loading} style={{
-          padding: '0.75rem', borderRadius: '4px', border: 'none',
-          background: submitting || loading ? '#475569' : '#38bdf8',
-          color: '#0f172a', fontWeight: 'bold', cursor: submitting || loading ? 'not-allowed' : 'pointer',
-        }}>
+
+        <button
+          type="submit"
+          disabled={disabled}
+          className="rounded bg-sky-400 py-2.5 text-sm font-bold text-slate-950 transition-colors hover:bg-sky-300 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+        >
           {submitting ? 'Submitting…' : `Execute ${type}`}
         </button>
       </form>
-    </div>
+    </Panel>
   );
 }

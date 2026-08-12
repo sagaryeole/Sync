@@ -278,23 +278,12 @@ Commits: `709ddfc` (baseline) → `75af356` (phase-0 fixes)
 
 **✅ Gate met:** `cd backend && python3 -m pytest -q` → **31 passed**.
 
-### Remaining Phase 0 item — your decision, not started
+### Remaining Phase 0 item
 
-- [ ] **7b. Push to `github.com/sagaryeole/Sync`**
-
-  Local history is clean and ready (2 commits, no secrets, no `node_modules`, no DB).
-  **Not pushed yet — two things to confirm first:**
-  1. **The repo is PUBLIC.** Pushing publishes this code permanently to a search-indexed,
-     forkable, cacheable location. There are no secrets in it (verified by scan), so this is safe —
-     but it should be a deliberate choice, not a side effect.
-  2. **The repo is named `Sync`, not `CryptoTradeApp`** — worth confirming it's the repo you meant.
-
-  When confirmed:
-  ```bash
-  git remote add origin https://github.com/sagaryeole/Sync.git
-  git branch -M main
-  git push -u origin main
-  ```
+- [x] **7b. Push to `github.com/sagaryeole/Sync`** ✅ — confirmed public repo, confirmed name
+  mismatch (`Sync`, not `CryptoTradeApp`) is intentional. All outstanding Phase 1–7 work was
+  committed (`202fd1e`), `main` fast-forwarded from `869d449`, and pushed:
+  `bce6a3f..202fd1e main -> main`. Local `main` and `origin/main` match; working tree clean.
 
 **✅ Phase 0 gate:** `cd backend && python3 -m pytest -q` → **31 passed**. `./dev.sh` starts both servers.
 
@@ -953,6 +942,64 @@ Start both servers and leave them running ~15 minutes:
 - [ ] The equity curve moves off the flat line
 - [ ] The leaderboard shows divergent returns between strategies
 - [ ] Unplugging the network degrades to `SIM` without a crash, and recovers on reconnect
+
+---
+
+---
+
+## 🔍 Post-implementation audit (2026-08-12)
+
+A systematic sweep of the uncommitted work found **nine defects in code marked
+`[x]` complete**. All are fixed; the pattern is worth noting — every one of them
+sat in a code path that no test exercised, so the suite stayed green throughout.
+
+**Runtime crashes (backend)**
+
+| # | Defect | Impact |
+| --- | --- | --- |
+| 1 | `api/strategies.py:cancel_order` used `ENGINE` without importing it | `DELETE /orders/{id}` → NameError/500 on every call |
+| 2 | `/strategies/{id}/metrics` passed raw ORM rows to `engine.metrics`, which takes matched `(buy, sell, pnl)` tuples from `_pair_trades()` and dicts for snapshots | 500 on every call — the entire metrics endpoint |
+| 3 | `profit_factor` can be `inf`; bare `Infinity` is invalid JSON | `JSON.parse()` rejects the whole response client-side |
+
+**Missing endpoints the frontend already called (specified in step 43, never built)**
+
+| # | Defect | Impact |
+| --- | --- | --- |
+| 4 | `GET /fills` did not exist (404) | Journal page permanently empty |
+| 5 | `GET /orders` did not exist (405 — only POST) | Orders page permanently empty |
+| 6 | `/strategies/key/{key}/metrics` did not exist (404) | Strategy detail parsed the 404 body as metrics, then crashed on `.toFixed(undefined)` |
+
+**Frontend crash class (step 54's guard was specified but never implemented)**
+
+| # | Defect | Impact |
+| --- | --- | --- |
+| 7 | `lib/format.ts` had **zero** null/NaN guards despite step 54 requiring "every one returns `'—'`"; the named `fmtTime`/`fmtDuration`/`signClass` didn't exist | Any null field threw during render |
+| 8 | 23 unguarded `.toFixed()` calls on network data across 6 files; the `no-restricted-syntax` ban step 54 specified was never added | React unmounts the tree on a render throw → one null price white-screened the whole terminal |
+| 9 | `ErrorBoundary` existed but was **never mounted** anywhere | Nothing contained a failure even when it was caught-able |
+
+**Also fixed**
+
+- `eslint .` was linting the minified `dist/` bundle — 385 bogus errors, so the
+  Phase 4 gate ("npm run lint passes") was never actually met. Now ignores build
+  output; source lints clean.
+- `JournalPage` was built in step 64 but never routed in `App.tsx` — unreachable.
+- `TopBar` rendered `<ConnectionPill />` with no props, so it was pinned to the
+  `'disconnected'` default and contradicted the terminal's own indicator. Feed
+  status now lives in `marketSlice` as one source of truth.
+- WS topic subscriptions were a boolean map, not refcounted — a page unmounting
+  dropped a topic another component still held.
+- `positions.stop_loss_price`/`take_profit_price` were coerced `None → 0.0`,
+  rendering "$0.00" (reads as a stop that fires immediately) instead of "—".
+- Tailwind v4 was installed with `@theme` tokens in steps 47–49 and then used
+  **zero** times — every component was inline-styled. Now converted.
+
+**Tests added:** 11 (`test_metrics_api.py`) + 22 frontend (`format.test.ts`, WS
+refcount). Backend 581 passed · frontend 45 passed · tsc clean · lint clean.
+
+> **The lesson for the remaining work:** a `[x]` in this file means "code was
+> written", not "code was exercised". Nine defects survived a 570-test suite
+> because the tests drove the modules directly and never went through the
+> HTTP/render path an actual user hits.
 
 ---
 

@@ -3,69 +3,102 @@ import AppShell from '../components/layout/AppShell';
 import TopBar from '../components/layout/TopBar';
 import NavTabs from '../components/layout/NavTabs';
 import { Fill } from '../types/trading';
+import { fmtUsd, fmtQty, fmtDateTime, signClass } from '../lib/format';
 
 const TABS = [
   { label: 'Terminal', href: '/' },
   { label: 'Strategies', href: '/strategies' },
   { label: 'Orders', href: '/orders' },
+  { label: 'Journal', href: '/journal' },
   { label: 'Settings', href: '/settings' },
 ];
+
+const TH = 'px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-slate-400';
+const TD = 'px-3 py-2 text-sm';
 
 export default function JournalPage() {
   const [fills, setFills] = useState<Fill[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
     fetch('/api/fills?limit=100')
-      .then(r => r.json())
-      .then(setFills)
-      .finally(() => setLoading(false));
+      .then((r) => {
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        return r.json();
+      })
+      .then((data) => {
+        if (cancelled) return;
+        // Never trust the shape — an error body would crash .map() below.
+        setFills(Array.isArray(data) ? data : []);
+        setError(null);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : 'Request failed');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   return (
     <AppShell>
       <TopBar />
       <NavTabs tabs={TABS} active="/journal" />
-      <main style={{ padding: '1.5rem', maxWidth: '1400px', margin: '0 auto' }}>
-        <h1 style={{ marginBottom: '1rem' }}>Trade Journal</h1>
+      <main className="mx-auto w-full max-w-[1400px] p-6">
+        <h1 className="mb-4 text-xl font-semibold text-slate-100">Trade Journal</h1>
 
-        {loading && <div style={{ color: '#94a3b8' }}>Loading…</div>}
+        {error && (
+          <div className="mb-4 rounded-md border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">
+            Could not load fills: {error}
+          </div>
+        )}
 
-        <div style={{ background: '#1e293b', borderRadius: '8px', overflow: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <div className="overflow-x-auto rounded-lg border border-slate-800 bg-slate-900">
+          <table className="w-full border-collapse">
             <thead>
-              <tr style={{ background: '#2d3748' }}>
-                <th style={thStyle}>Time</th>
-                <th style={thStyle}>Symbol</th>
-                <th style={thStyle}>Side</th>
-                <th style={thStyle}>Qty</th>
-                <th style={thStyle}>Price</th>
-                <th style={thStyle}>Fee</th>
-                <th style={thStyle}>P&L</th>
-                <th style={thStyle}>Liq</th>
+              <tr className="border-b border-slate-800 bg-slate-800/50">
+                <th className={TH}>Time</th>
+                <th className={TH}>Symbol</th>
+                <th className={TH}>Side</th>
+                <th className={`${TH} text-right`}>Qty</th>
+                <th className={`${TH} text-right`}>Price</th>
+                <th className={`${TH} text-right`}>Fee</th>
+                <th className={`${TH} text-right`}>P&amp;L</th>
+                <th className={TH}>Liq</th>
               </tr>
             </thead>
             <tbody>
-              {fills.map(f => (
-                <tr key={f.id} style={{ borderBottom: '1px solid #334155' }}>
-                  <td style={tdStyle}>{new Date(f.ts).toLocaleString()}</td>
-                  <td style={tdStyle}>{f.symbol}</td>
-                  <td style={tdStyle}>{f.side}</td>
-                  <td style={tdStyle}>{f.quantity.toFixed(4)}</td>
-                  <td style={tdStyle}>{f.price.toFixed(2)}</td>
-                  <td style={tdStyle}>{f.fee.toFixed(2)}</td>
-                  <td style={{
-                    ...tdStyle,
-                    color: f.realized_pnl >= 0 ? '#4ade80' : '#f87171',
-                  }}>
-                    {f.realized_pnl.toFixed(2)}
+              {fills.map((f) => (
+                <tr key={f.id} className="border-b border-slate-800/60 last:border-0 hover:bg-slate-800/30">
+                  <td className={`${TD} text-slate-400`}>{fmtDateTime(f.ts)}</td>
+                  <td className={`${TD} font-medium text-slate-200`}>{f.symbol}</td>
+                  <td className={`${TD} ${f.side === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {f.side}
                   </td>
-                  <td style={tdStyle}>{f.liquidity}</td>
+                  <td className={`${TD} text-right tabular-nums`}>{fmtQty(f.quantity, 4)}</td>
+                  <td className={`${TD} text-right tabular-nums`}>{fmtUsd(f.price)}</td>
+                  <td className={`${TD} text-right tabular-nums text-slate-400`}>{fmtUsd(f.fee)}</td>
+                  <td className={`${TD} text-right tabular-nums ${signClass(f.realized_pnl)}`}>
+                    {fmtUsd(f.realized_pnl)}
+                  </td>
+                  <td className={`${TD} text-slate-400`}>{f.liquidity}</td>
                 </tr>
               ))}
-              {fills.length === 0 && !loading && (
+              {loading && (
                 <tr>
-                  <td colSpan={8} style={{ padding: '1rem', textAlign: 'center', color: '#64748b' }}>
+                  <td colSpan={8} className="px-3 py-8 text-center text-sm text-slate-500">
+                    Loading…
+                  </td>
+                </tr>
+              )}
+              {!loading && fills.length === 0 && !error && (
+                <tr>
+                  <td colSpan={8} className="px-3 py-8 text-center text-sm text-slate-500">
                     No fills yet
                   </td>
                 </tr>
@@ -77,16 +110,3 @@ export default function JournalPage() {
     </AppShell>
   );
 }
-
-const thStyle = {
-  padding: '0.75rem',
-  textAlign: 'left' as const,
-  color: '#94a3b8',
-  fontSize: '0.875rem',
-  fontWeight: 500,
-} as const;
-
-const tdStyle = {
-  padding: '0.75rem',
-  fontSize: '0.875rem',
-} as const;

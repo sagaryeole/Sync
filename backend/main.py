@@ -14,18 +14,21 @@ from settings import get_settings
 from feeds.symbols import SYMBOLS
 from feeds.backfill import backfill_candles
 from feeds.manager import FeedManager
+from engine import events
 from engine.market_state import MARKET
 from engine.core import PaperEngine, EngineConfig
 from engine.paper_broker import PaperBroker
 from engine.risk import RiskConfig, RiskManager
 from scheduler import start_scheduler
 from sqlalchemy.dialects.sqlite import insert
+from ws.hub import HUB
+from ws.protocol import make_envelope
 
 from api.market import router as market_router
 from api.trading import router as trading_router
 from api.bot import router as bot_router
 from api.strategies import router as strategies_router
-from api.ws_routes import router as ws_router
+from api.ws_routes import router as ws_router, start_event_pump, stop_event_pump
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api.main")
@@ -46,6 +49,7 @@ ENGINE = PaperEngine(
         impact_notional=_settings.impact_notional,
         min_notional=_settings.min_notional,
         tradable_symbols=set(_settings.symbols),
+        max_open_positions=_settings.max_open_positions,
     ),
     risk_manager=RiskManager(RiskConfig(
         max_open_positions=_settings.max_open_positions,
@@ -99,7 +103,9 @@ def load_engine_from_db() -> None:
         session.close()
 
 async def candle_flusher_task():
-    """Background task to flush rolled/closed candles to the SQLite database."""
+    """Background task to flush rolled/closed candles to the SQLite database,
+    then broadcast them over WS (closed:true) once the write is durable.
+    """
     settings = get_settings()
     while True:
         try:
@@ -109,6 +115,7 @@ async def candle_flusher_task():
                 continue
 
             session = get_session()
+            committed = False
             try:
                 for candle in closed:
                     stmt = insert(Candle).values(
@@ -137,11 +144,27 @@ async def candle_flusher_task():
                     )
                     session.execute(stmt)
                 session.commit()
+                committed = True
             except Exception as e:
                 session.rollback()
                 logger.error("Error in database candle flusher: %s", e)
             finally:
                 session.close()
+
+            if committed:
+                for candle in closed:
+                    env = make_envelope("candle", "candles:%s:%s" % (candle.symbol, candle.interval), {
+                        "symbol": candle.symbol,
+                        "interval": candle.interval,
+                        "t": int(candle.open_time.timestamp()),
+                        "o": candle.open,
+                        "h": candle.high,
+                        "l": candle.low,
+                        "c": candle.close,
+                        "v": candle.volume,
+                        "closed": True,
+                    })
+                    await HUB.publish(env)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -150,6 +173,7 @@ async def candle_flusher_task():
 async def legacy_price_syncer_task():
     """Syncs live tick prices from MARKET to the legacy PriceTicker table for compatibility."""
     settings = get_settings()
+    last_synced: Dict[str, float] = {}
     while True:
         try:
             await asyncio.sleep(5.0)
@@ -158,11 +182,14 @@ async def legacy_price_syncer_task():
                 for sym in settings.symbols:
                     price = MARKET.last(sym)
                     if price is not None:
-                        session.add(PriceTicker(
-                            symbol=sym,
-                            price=price,
-                            timestamp=datetime.now(timezone.utc)
-                        ))
+                        prev = last_synced.get(sym)
+                        if prev is None or abs(price - prev) > 1e-8:
+                            session.add(PriceTicker(
+                                symbol=sym,
+                                price=price,
+                                timestamp=datetime.now(timezone.utc)
+                            ))
+                            last_synced[sym] = price
                 session.commit()
             except Exception as e:
                 session.rollback()
@@ -173,6 +200,64 @@ async def legacy_price_syncer_task():
             break
         except Exception as e:
             logger.error("Unexpected error in legacy price syncer: %s", e)
+
+
+async def tick_broadcaster_task():
+    """Broadcasts batched ticks + live in-progress candle deltas to WS
+    clients at settings.broadcast_hz.
+
+    Architecture (docs/ARCHITECTURE.md): MARKET.take_dirty() -> Hub.publish,
+    directly — this task already lives on the asyncio loop, so there's no
+    need to hop through the thread-safe EVENT_BUS the way scheduler-thread
+    events (fills, signals, equity, halts) do.
+    """
+    settings = get_settings()
+    interval = 1.0 / settings.broadcast_hz if settings.broadcast_hz > 0 else 0.25
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            dirty = MARKET.take_dirty()
+            if not dirty:
+                continue
+
+            ticks_payload = []
+            for sym in dirty:
+                tick = MARKET.last_tick(sym)
+                if tick is None:
+                    continue
+                ticks_payload.append({
+                    "s": sym,
+                    "p": tick.price,
+                    "b": tick.bid,
+                    "a": tick.ask,
+                    "chg24h": tick.change_24h_pct,
+                    "v24h": tick.volume_24h,
+                    "t": int(tick.ts.timestamp() * 1000) if tick.ts else None,
+                    "src": tick.source,
+                })
+            if ticks_payload:
+                await HUB.publish(make_envelope("tick", "ticks", {"ticks": ticks_payload}))
+
+            for sym in dirty:
+                open_c = MARKET.open_candle(sym)
+                if open_c is None:
+                    continue
+                env = make_envelope("candle", "candles:%s:1m" % sym, {
+                    "symbol": sym,
+                    "interval": "1m",
+                    "t": int(open_c["open_time"].timestamp()) if open_c.get("open_time") else None,
+                    "o": open_c["open"],
+                    "h": open_c["high"],
+                    "l": open_c["low"],
+                    "c": open_c["close"],
+                    "v": open_c["volume"],
+                    "closed": False,
+                })
+                await HUB.publish(env)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Unexpected error in tick broadcaster: %s", e)
 
 
 @asynccontextmanager
@@ -202,9 +287,33 @@ async def lifespan(app: FastAPI):
             fills_by_strategy.setdefault(f.strategy_id, []).append(f)
         marks = {sym: MARKET.last(sym) for sym in settings.symbols if MARKET.last(sym) is not None}
         rebuild = ENGINE.rebuild_from_fills(fills_by_strategy, marks)
-        logger.info("H5 startup rebuild: %s strategies rebuilt from fills", len(rebuild))
+        diverged = []
+        for strategy_id, rebuilt in rebuild.items():
+            account = ENGINE.get_account(strategy_id)
+            if account is None:
+                continue
+            cash_diff = abs(account.cash - rebuilt["cash"])
+            for sym, rebuilt_qty in rebuilt["positions"].items():
+                cached_qty = account.get_position(sym)
+                cached_qty_val = cached_qty.quantity if cached_qty else 0.0
+                if abs(rebuilt_qty - cached_qty_val) > 1e-6:
+                    diverged.append(f"strategy {strategy_id} {sym} qty cached={cached_qty_val} rebuilt={rebuilt_qty}")
+            if cash_diff > 1e-6:
+                diverged.append(f"strategy {strategy_id} cash cached={account.cash} rebuilt={rebuilt['cash']}")
+            pnl_diff = abs(account.realized_pnl - rebuilt["realized_pnl"])
+            if pnl_diff > 1e-6:
+                diverged.append(f"strategy {strategy_id} realized_pnl cached={account.realized_pnl} rebuilt={rebuilt['realized_pnl']}")
+        if diverged:
+            logger.warning("H5 startup divergence detected: %s", "; ".join(diverged))
+        else:
+            logger.info("H5 startup rebuild: %s strategies verified against fills", len(rebuild))
     finally:
         session.close()
+
+    # 4b. Start the WS event-bus pump BEFORE the scheduler/feed so nothing
+    # emitted right after startup (feed status, early fills) is stranded in
+    # EVENT_BUS waiting for a first WS client to lazily start it.
+    start_event_pump()
 
     scheduler = start_scheduler(ENGINE, MARKET, settings.symbols, feed_manager)
 
@@ -213,7 +322,7 @@ async def lifespan(app: FastAPI):
         await feed_manager.start(
             symbols=settings.symbols,
             on_tick=MARKET.on_tick,
-            on_status=lambda s: None,
+            on_status=lambda s: events.emit("feed", "feed", s),
             on_provider_change=lambda p: MARKET.close_all_candles()
         )
     feed_task = asyncio.create_task(run_feed())
@@ -222,8 +331,10 @@ async def lifespan(app: FastAPI):
     # 6. Start background synchronization tasks
     flusher_task = asyncio.create_task(candle_flusher_task())
     syncer_task = asyncio.create_task(legacy_price_syncer_task())
+    broadcaster_task = asyncio.create_task(tick_broadcaster_task())
     background_tasks.add(flusher_task)
     background_tasks.add(syncer_task)
+    background_tasks.add(broadcaster_task)
 
     yield
 
@@ -237,6 +348,10 @@ async def lifespan(app: FastAPI):
         task.cancel()
     await asyncio.gather(*background_tasks, return_exceptions=True)
     background_tasks.clear()
+
+    # Stop the WS event-bus pump — no more scheduler/feed threads producing
+    # events past this point, safe to drain and stop.
+    await stop_event_pump()
 
     # Final candle flush
     MARKET.close_all_candles()
@@ -256,6 +371,18 @@ async def lifespan(app: FastAPI):
                     volume=candle.volume,
                     trades=candle.trades,
                     source=candle.source
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["symbol", "interval", "open_time"],
+                    set_={
+                        "open": stmt.excluded.open,
+                        "high": stmt.excluded.high,
+                        "low": stmt.excluded.low,
+                        "close": stmt.excluded.close,
+                        "volume": stmt.excluded.volume,
+                        "trades": stmt.excluded.trades,
+                        "source": stmt.excluded.source
+                    }
                 )
                 session.execute(stmt)
             session.commit()

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { ErrorBoundary } from '../components/common/ErrorBoundary';
 
@@ -18,6 +18,7 @@ describe('ErrorBoundary', () => {
       throw new Error('Boom');
     };
 
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     render(
       <ErrorBoundary fallback={<div data-testid="fallback">Custom fallback</div>}>
         <BadComponent />
@@ -26,6 +27,7 @@ describe('ErrorBoundary', () => {
 
     expect(screen.getByTestId('fallback')).toBeDefined();
     expect(screen.getByText('Custom fallback')).toBeDefined();
+    spy.mockRestore();
   });
 
   it('renders default error UI when no fallback provided', () => {
@@ -33,6 +35,7 @@ describe('ErrorBoundary', () => {
       throw new Error('Boom');
     };
 
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     render(
       <ErrorBoundary>
         <BadComponent />
@@ -41,5 +44,6 @@ describe('ErrorBoundary', () => {
 
     expect(screen.getByText('Something went wrong')).toBeDefined();
     expect(screen.getByText('Boom')).toBeDefined();
+    spy.mockRestore();
   });
 });

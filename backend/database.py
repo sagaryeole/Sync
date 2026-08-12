@@ -70,7 +70,10 @@ def init_db():
             {"key": "manual", "name": "Manual Portfolio", "description": "User manual trades and execution"},
             {"key": "sma_crossover", "name": "SMA Crossover", "description": "SMA(9) vs SMA(21) Golden/Death Cross"},
             {"key": "rsi_reversion", "name": "RSI Reversion", "description": "RSI(14) Oversold reversion strategy"},
-            {"key": "momentum_breakout", "name": "Momentum Breakout", "description": "Donchian channel breakout strategy"}
+            {"key": "momentum_breakout", "name": "Momentum Breakout", "description": "Donchian channel breakout strategy"},
+            {"key": "trend_ensemble", "name": "Trend Ensemble (vol-targeted)",
+             "description": "Multi-horizon EMA trend ensemble, volatility-targeted, "
+                            "with a hysteresis band and a cost gate"},
         ]
         
         for strat in strategies_to_seed:

@@ -1,24 +1,16 @@
+import { fmtUsd, signClass } from '../../lib/format';
+
 interface Props {
   symbol: string;
-  price: number;
-  change?: number;
+  price: number | null | undefined;
+  change?: number | null;
 }
 
 export default function TickerPill({ symbol, price, change }: Props) {
-  const color = change === undefined ? '#cbd5e1' : change >= 0 ? '#4ade80' : '#f87171';
   return (
-    <div style={{
-      display: 'inline-flex',
-      alignItems: 'center',
-      gap: '0.5rem',
-      padding: '0.25rem 0.75rem',
-      background: '#1e293b',
-      borderRadius: '9999px',
-      border: '1px solid #334155',
-      fontSize: '0.875rem',
-    }}>
-      <span style={{ color, fontWeight: 600 }}>{symbol}</span>
-      <span style={{ color: '#94a3b8' }}>${price.toFixed(2)}</span>
+    <div className="inline-flex items-center gap-2 rounded-full border border-slate-800 bg-slate-900 px-3 py-1 text-sm">
+      <span className={`font-semibold ${signClass(change)}`}>{symbol}</span>
+      <span className="tabular-nums text-slate-400">{fmtUsd(price)}</span>
     </div>
   );
 }

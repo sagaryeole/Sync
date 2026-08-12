@@ -251,3 +251,50 @@ class TestRunAll:
         assert r.decision.action == Action.BUY
         assert r.fill is None
         assert r.reject_reason is None
+
+    def test_dry_run_survives_the_db_storage_round_trip(self, engine, market):
+        """Regression: dry_run must still work when the config is built the
+        way scheduler._strategy_configs() actually builds it — json.loads()
+        the DB's params_json, then validate_params(), then hand the result to
+        RunnerStrategyConfig. The test above sets params={"dry_run": True}
+        directly and would pass even if validate_params() silently dropped
+        the flag (which it did — every per-strategy pydantic schema is a
+        closed model with no dry_run field, so it hit pydantic's default
+        extra="ignore" and vanished on the way out of validate_params()).
+        That means a strategy an operator believes is in V4 shadow mode would
+        actually be trading with real capital — this test goes through the
+        exact same path the scheduler uses, so it fails if that regresses.
+        """
+        import json
+        from strategies.schemas import validate_params
+
+        strategy = SMACrossoverStrategy()
+        register(strategy)
+        engine.register_strategy(1, "sma_crossover", 100000.0)
+
+        prices = [100.0] * 30 + [120.0]
+        _CANDLES["BTC"] = _make_candles(prices)
+        market.on_tick_batch([
+            {"symbol": "BTC", "price": 120.0, "bid": 119.5, "ask": 120.5},
+        ])
+
+        params_json = json.dumps({"fast": 9, "slow": 21, "dry_run": True})
+        raw = json.loads(params_json)
+        validated = validate_params("sma_crossover", raw)
+        assert validated.get("dry_run") is True, (
+            "validate_params() dropped dry_run — V4 shadow mode is broken"
+        )
+
+        runner = StrategyRunner(engine, market, _candle_provider, ["BTC"])
+        configs = [
+            RunnerStrategyConfig(strategy_id=1, key="sma_crossover", params=validated),
+        ]
+        results = runner.run_all(configs)
+
+        assert len(results) == 1
+        r = results[0]
+        assert r.decision.action == Action.BUY
+        assert r.fill is None, "dry_run strategy submitted a real order"
+        assert engine.get_account(1).cash == pytest.approx(100000.0), (
+            "dry_run strategy moved real cash"
+        )
